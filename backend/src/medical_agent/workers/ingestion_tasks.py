@@ -1,0 +1,2 @@
+"""Hospital asset ingestion tasks."""
+

@@ -1,0 +1,8 @@
+# The repository owner reviews all changes until dedicated teams are created.
+* @HatCat33
+
+# High-risk areas require explicit review.
+/backend/src/medical_agent/modules/safety/ @HatCat33
+/backend/src/medical_agent/modules/identity/ @HatCat33
+/prompts/safety/ @HatCat33
+/infra/ @HatCat33

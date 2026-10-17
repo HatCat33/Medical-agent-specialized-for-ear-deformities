@@ -1,0 +1,3 @@
+# Production values are deployment-specific and must reference managed secrets.
+services: {}
+

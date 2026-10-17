@@ -1,0 +1,2 @@
+"""Browser channel endpoints."""
+

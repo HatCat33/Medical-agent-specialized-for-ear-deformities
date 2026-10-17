@@ -1,0 +1,37 @@
+name: 功能建议
+description: 提议一个有明确业务价值的功能
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 业务问题
+      description: 说明目标用户、使用场景和当前困难，不要包含真实患者信息。
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 期望结果
+      description: 描述可验证的结果，而不是只指定某个技术实现。
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: 涉及范围
+      options:
+        - 普通产品功能
+        - 医疗安全或内容
+        - 患者数据或权限
+        - 模型、RAG 或提示词
+        - 部署、监控或运维
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 列出可以验证功能完成的条件。

@@ -1,0 +1,62 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.venv/
+backend/.venv/
+.coverage
+.coverage.*
+htmlcov/
+
+# Node
+node_modules/
+dist/
+coverage/
+.vite/
+.pnpm-store/
+playwright-report/
+test-results/
+blob-report/
+*-debug.log*
+
+# Runtime data (never commit patient or hospital data)
+data/
+uploads/
+models/
+logs/
+private/
+hospital-data/
+source-materials/
+exports/
+backups/
+*.log
+*.db
+*.sqlite*
+*.pid
+*.tmp
+
+# Generated artifacts
+.artifacts/
+evals/reports/*
+!evals/reports/.gitkeep
+packages/api-client/src/generated/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+

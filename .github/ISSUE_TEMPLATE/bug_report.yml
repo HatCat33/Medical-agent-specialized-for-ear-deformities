@@ -1,0 +1,40 @@
+name: Bug 报告
+description: 报告可复现的产品或代码问题
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: 请勿上传患者数据、医院源文件、有效密钥或未脱敏日志。
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 分支、标签或提交号
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 说明实际表现和预期表现。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 使用脱敏数据给出最小复现步骤。
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境信息
+      description: 浏览器、操作系统、部署方式及相关版本。
+  - type: textarea
+    id: checks
+    attributes:
+      label: 已执行检查
+      description: 列出测试、日志检查或临时解决方法。

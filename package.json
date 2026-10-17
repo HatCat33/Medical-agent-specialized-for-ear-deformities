@@ -1,0 +1,27 @@
+{
+  "name": "medical-agent-workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "dev:h5": "pnpm --filter @medical-agent/web-h5 dev",
+    "dev:admin": "pnpm --filter @medical-agent/admin-web dev",
+    "build": "pnpm -r build",
+    "lint": "eslint .",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "test:e2e:visual": "node tests/e2e/visual-smoke.mjs",
+    "test:e2e:stream": "node tests/e2e/streaming-smoke.mjs",
+    "test:e2e:markdown": "node tests/e2e/markdown-spacing-smoke.mjs"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.0",
+    "@playwright/test": "^1.64.0",
+    "eslint": "^10.0.0",
+    "eslint-plugin-react-hooks": "^7.0.0",
+    "eslint-plugin-react-refresh": "^0.5.0",
+    "globals": "^17.0.0",
+    "typescript-eslint": "^8.0.0"
+  }
+}
+
