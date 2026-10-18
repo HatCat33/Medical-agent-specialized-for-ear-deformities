@@ -4,7 +4,8 @@ import path from "node:path";
 
 import { chromium } from "@playwright/test";
 
-const baseUrl = process.env.E2E_BASE_URL ?? "http://127.0.0.1:5173";
+const localProtocol = existsSync(".certs/dev-server.crt") ? "https" : "http";
+const baseUrl = process.env.E2E_BASE_URL ?? `${localProtocol}://127.0.0.1:5173`;
 const outputDir = path.resolve(".artifacts", "visual-check");
 const browserCandidates = [
   process.env.PLAYWRIGHT_EXECUTABLE_PATH,
@@ -18,7 +19,10 @@ await mkdir(outputDir, { recursive: true });
 const browser = await chromium.launch(executablePath ? { executablePath } : {});
 
 try {
-  const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  const page = await browser.newPage({
+    viewport: { width: 390, height: 844 },
+    ignoreHTTPSErrors: true,
+  });
   await page.goto(baseUrl, { waitUntil: "networkidle" });
 
   await page.evaluate(() => {

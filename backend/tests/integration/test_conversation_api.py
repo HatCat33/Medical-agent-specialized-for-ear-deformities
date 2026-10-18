@@ -13,11 +13,26 @@ from medical_agent.core.config import Settings
 from medical_agent.core.database import Base, get_db
 from medical_agent.modules.conversation import service as conversation_service
 from medical_agent.modules.conversation.models import Message
+from medical_agent.modules.media import router as media_router_module
+from medical_agent.modules.speech import router as speech_router_module
+from medical_agent.modules.speech import service as speech_service
 from medical_agent.providers.llm.client import DemoChatProvider
+from medical_agent.providers.speech.protocol import AudioInput
 
 
 def build_demo_provider(_: Settings) -> DemoChatProvider:
     return DemoChatProvider()
+
+
+class StubSpeechProvider:
+    async def transcribe(self, audio: AudioInput) -> str:
+        assert audio.media_type == "audio/webm"
+        assert audio.data.startswith(b"\x1aE\xdf\xa3")
+        return "语音转写后的问题"
+
+
+def build_stub_speech_provider(_: Settings) -> StubSpeechProvider:
+    return StubSpeechProvider()
 
 
 @pytest.fixture
@@ -30,6 +45,11 @@ async def api_client(
         "build_chat_provider",
         build_demo_provider,
     )
+    settings = Settings(media_storage_path=str(tmp_path / "media"))
+    monkeypatch.setattr(conversation_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(media_router_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(speech_router_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(speech_service, "build_speech_provider", build_stub_speech_provider)
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
@@ -77,7 +97,7 @@ async def test_conversation_lifecycle_and_owner_isolation(
     assert payload["user_message"]["sequence_no"] == 1
     assert payload["assistant_message"]["sequence_no"] == 2
     assert payload["assistant_message"]["safety_code"] == "allowed"
-    assert "第一版演示模式" in payload["assistant_message"]["content"]
+    assert "第二版演示模式" in payload["assistant_message"]["content"]
     assert payload["conversation"]["title"] == "第一次就诊前需要准备什么？"
 
     history = await client.get(
@@ -161,3 +181,114 @@ async def test_streaming_boundary_response_is_emitted_and_saved(
     messages = history.json()["messages"]
     assert [message["role"] for message in messages] == ["user", "assistant"]
     assert messages[1]["safety_code"] == "medical_boundary"
+
+
+@pytest.mark.asyncio
+async def test_image_attachments_are_private_persisted_and_deleted_with_history(
+    api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    client, _ = api_client
+    owner_headers = {"X-Visitor-ID": "visitor-media-owner-005"}
+    other_headers = {"X-Visitor-ID": "visitor-media-other-006"}
+    png = b"\x89PNG\r\n\x1a\n" + b"test-image-content"
+
+    uploaded = await client.post(
+        "/api/v1/media/images",
+        files=[
+            ("images", ("front.png", png, "image/png")),
+            ("images", ("side.png", png, "image/png")),
+        ],
+        headers=owner_headers,
+    )
+    assert uploaded.status_code == 201
+    media = uploaded.json()
+    assert len(media) == 2
+    assert all(item["status"] == "pending" for item in media)
+
+    media_id = media[0]["id"]
+    assert (
+        await client.get(f"/api/v1/media/{media_id}/content", headers=other_headers)
+    ).status_code == 404
+    content = await client.get(f"/api/v1/media/{media_id}/content", headers=owner_headers)
+    assert content.status_code == 200
+    assert content.content == png
+
+    created = await client.post("/api/v1/conversations", json={}, headers=owner_headers)
+    conversation_id = created.json()["id"]
+    sent = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages",
+        json={
+            "content": "",
+            "attachment_ids": [item["id"] for item in media],
+            "input_mode": "multimodal",
+        },
+        headers=owner_headers,
+    )
+    assert sent.status_code == 200
+    user_message = sent.json()["user_message"]
+    assert user_message["content"] == "请对上传图片中与耳部健康科普相关的可见信息进行客观说明。"
+    assert [item["id"] for item in user_message["attachments"]] == [
+        item["id"] for item in media
+    ]
+    assert all(item["status"] == "attached" for item in user_message["attachments"])
+
+    history = await client.get(
+        f"/api/v1/conversations/{conversation_id}", headers=owner_headers
+    )
+    assert [item["id"] for item in history.json()["messages"][0]["attachments"]] == [
+        item["id"] for item in media
+    ]
+    assert (
+        await client.delete(f"/api/v1/media/{media_id}", headers=owner_headers)
+    ).status_code == 409
+
+    deleted = await client.delete(
+        f"/api/v1/conversations/{conversation_id}", headers=owner_headers
+    )
+    assert deleted.status_code == 204
+    assert (
+        await client.get(f"/api/v1/media/{media_id}/content", headers=owner_headers)
+    ).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_media_rejects_unsupported_content(
+    api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    client, _ = api_client
+    response = await client.post(
+        "/api/v1/media/images",
+        files=[("images", ("fake.png", b"not-an-image", "image/png"))],
+        headers={"X-Visitor-ID": "visitor-media-invalid-007"},
+    )
+    assert response.status_code == 415
+
+
+@pytest.mark.asyncio
+async def test_audio_is_transcribed_without_becoming_persistent_media(
+    api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    client, _ = api_client
+    webm = b"\x1aE\xdf\xa3" + b"ephemeral-audio-content"
+
+    response = await client.post(
+        "/api/v1/speech/transcriptions",
+        files=[("audio", ("recording.webm", webm, "audio/webm"))],
+        headers={"X-Visitor-ID": "visitor-speech-008"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"text": "语音转写后的问题"}
+
+
+@pytest.mark.asyncio
+async def test_audio_transcription_rejects_unknown_content(
+    api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    client, _ = api_client
+    response = await client.post(
+        "/api/v1/speech/transcriptions",
+        files=[("audio", ("recording.webm", b"not-audio", "audio/webm"))],
+        headers={"X-Visitor-ID": "visitor-speech-invalid-009"},
+    )
+    assert response.status_code == 415

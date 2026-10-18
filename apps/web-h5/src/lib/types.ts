@@ -7,6 +7,22 @@ export interface Conversation {
   last_message_at: string | null;
 }
 
+export interface MediaAttachment {
+  id: string;
+  kind: "image" | "audio";
+  original_name: string;
+  media_type: string;
+  size_bytes: number;
+  status: string;
+  created_at: string;
+}
+
+export interface SelectedImage {
+  id: string;
+  file: File;
+  previewUrl: string;
+}
+
 export interface Message {
   id: string;
   conversation_id: string;
@@ -16,6 +32,7 @@ export interface Message {
   status: string;
   safety_code: string | null;
   created_at: string;
+  attachments: MediaAttachment[];
 }
 
 export interface ConversationDetail extends Conversation {
@@ -33,3 +50,9 @@ export interface StreamMessageHandlers {
   onDelta: (content: string) => void;
   onDone: (message: Message) => void;
 }
+
+export interface TranscriptionResult {
+  text: string;
+}
+
+export type InputMode = "text" | "voice" | "multimodal";

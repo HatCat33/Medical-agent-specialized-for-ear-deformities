@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from medical_agent.modules.conversation.models import Conversation, Message
 
@@ -56,7 +57,12 @@ async def list_messages(
     limit: int | None = None,
 ) -> list[Message]:
     order = Message.sequence_no.desc() if limit else Message.sequence_no.asc()
-    statement = select(Message).where(Message.conversation_id == conversation_id).order_by(order)
+    statement = (
+        select(Message)
+        .options(selectinload(Message.attachments))
+        .where(Message.conversation_id == conversation_id)
+        .order_by(order)
+    )
     if limit:
         statement = statement.limit(limit)
     messages = list(await db.scalars(statement))
@@ -84,6 +90,7 @@ async def add_message(
         content=content,
         status=status,
         safety_code=safety_code,
+        attachments=[],
     )
     conversation.last_message_at = now
     conversation.updated_at = now

@@ -6,6 +6,7 @@ from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, Uniqu
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from medical_agent.core.database import Base
+from medical_agent.modules.media.models import MediaObject
 
 
 def utc_now() -> datetime:
@@ -48,6 +49,13 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+    attachments: Mapped[list[MediaObject]] = relationship(
+        back_populates="message",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="selectin",
+        order_by=MediaObject.created_at,
+    )
 
     __table_args__ = (
         UniqueConstraint("conversation_id", "sequence_no", name="uq_message_sequence"),

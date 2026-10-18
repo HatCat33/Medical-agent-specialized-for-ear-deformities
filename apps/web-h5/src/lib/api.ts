@@ -1,9 +1,12 @@
 import type {
   Conversation,
   ConversationDetail,
+  InputMode,
+  MediaAttachment,
   Message,
   SendMessageResponse,
   StreamMessageHandlers,
+  TranscriptionResult,
 } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
@@ -47,6 +50,41 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function uploadImages(files: File[]): Promise<MediaAttachment[]> {
+  const body = new FormData();
+  files.forEach((file) => body.append("images", file, file.name));
+  const response = await fetch(`${API_BASE}/media/images`, {
+    method: "POST",
+    headers: { "X-Visitor-ID": visitorId() },
+    body,
+  });
+  if (!response.ok) throw new Error(`media_upload_failed_${response.status}`);
+  return response.json() as Promise<MediaAttachment[]>;
+}
+
+async function mediaBlob(mediaId: string): Promise<Blob> {
+  const response = await fetch(`${API_BASE}/media/${mediaId}/content`, {
+    headers: { "X-Visitor-ID": visitorId() },
+  });
+  if (!response.ok) throw new Error(`media_load_failed_${response.status}`);
+  return response.blob();
+}
+
+async function transcribeAudio(file: File): Promise<TranscriptionResult> {
+  const body = new FormData();
+  body.append("audio", file, file.name);
+  const response = await fetch(`${API_BASE}/speech/transcriptions`, {
+    method: "POST",
+    headers: { "X-Visitor-ID": visitorId() },
+    body,
+  });
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new Error(payload?.detail ?? `speech_transcription_failed_${response.status}`);
+  }
+  return response.json() as Promise<TranscriptionResult>;
+}
+
 interface StreamPayload {
   message?: Message | string;
   content?: string;
@@ -55,6 +93,8 @@ interface StreamPayload {
 async function streamMessage(
   conversationId: string,
   content: string,
+  attachmentIds: string[],
+  inputMode: InputMode,
   handlers: StreamMessageHandlers,
   signal: AbortSignal,
 ): Promise<void> {
@@ -64,7 +104,11 @@ async function streamMessage(
       "Content-Type": "application/json",
       "X-Visitor-ID": visitorId(),
     },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({
+      content,
+      attachment_ids: attachmentIds,
+      input_mode: inputMode,
+    }),
     signal,
   });
   if (!response.ok || !response.body) {
@@ -124,6 +168,11 @@ export const api = {
     request<ConversationDetail>(`/conversations/${conversationId}`),
   deleteConversation: (conversationId: string) =>
     request<void>(`/conversations/${conversationId}`, { method: "DELETE" }),
+  uploadImages,
+  transcribeAudio,
+  mediaBlob,
+  deleteMedia: (mediaId: string) =>
+    request<void>(`/media/${mediaId}`, { method: "DELETE" }),
   sendMessage: (conversationId: string, content: string) =>
     request<SendMessageResponse>(`/conversations/${conversationId}/messages`, {
       method: "POST",

@@ -5,6 +5,7 @@
   "packageManager": "pnpm@11.25.0",
   "scripts": {
     "dev:h5": "pnpm --filter @medical-agent/web-h5 dev",
+    "setup:https": "powershell -ExecutionPolicy Bypass -File infra/scripts/setup-dev-https.ps1",
     "dev:admin": "pnpm --filter @medical-agent/admin-web dev",
     "build": "pnpm -r build",
     "lint": "eslint .",
@@ -12,6 +13,7 @@
     "test": "pnpm -r test",
     "test:e2e:visual": "node tests/e2e/visual-smoke.mjs",
     "test:e2e:stream": "node tests/e2e/streaming-smoke.mjs",
+    "test:e2e:voice": "node tests/e2e/voice-input-smoke.mjs",
     "test:e2e:markdown": "node tests/e2e/markdown-spacing-smoke.mjs"
   },
   "devDependencies": {

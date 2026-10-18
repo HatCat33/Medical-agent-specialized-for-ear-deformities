@@ -6,9 +6,16 @@ from typing import Protocol
 
 
 @dataclass(frozen=True)
+class ImageInput:
+    media_type: str
+    data: bytes
+
+
+@dataclass(frozen=True)
 class ChatTurn:
     role: str
     content: str
+    images: tuple[ImageInput, ...] = ()
 
 
 class ChatProvider(Protocol):

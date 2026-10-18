@@ -9,7 +9,9 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from medical_agent.api.dependencies import current_owner_id
+from medical_agent.core.config import get_settings
 from medical_agent.core.database import get_db
+from medical_agent.core.logging import get_logger
 from medical_agent.modules.conversation import repository, service
 from medical_agent.modules.conversation.models import Message
 from medical_agent.modules.conversation.schemas import (
@@ -20,8 +22,10 @@ from medical_agent.modules.conversation.schemas import (
     SendMessageRequest,
     SendMessageResponse,
 )
+from medical_agent.modules.media import service as media_service
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+logger = get_logger(__name__)
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 OwnerId = Annotated[str, Depends(current_owner_id)]
 
@@ -82,6 +86,8 @@ async def send_message(
         db,
         conversation=conversation,
         content=payload.content,
+        attachment_ids=payload.attachment_ids,
+        input_mode=payload.input_mode,
     )
     return SendMessageResponse(
         conversation=ConversationRead.model_validate(conversation),
@@ -109,6 +115,8 @@ async def stream_message(
                 db,
                 conversation=conversation,
                 content=payload.content,
+                attachment_ids=payload.attachment_ids,
+                input_mode=payload.input_mode,
             ):
                 if event in {"user_message", "done"}:
                     if not isinstance(value, Message):
@@ -119,7 +127,11 @@ async def stream_message(
                 encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
                 yield f"event: {event}\ndata: {encoded}\n\n"
         # Once streaming starts, failures must be reported inside the event stream.
-        except Exception:  # noqa: BLE001
+        except Exception:
+            logger.exception(
+                "conversation_stream_failed",
+                conversation_id=conversation_id,
+            )
             await db.rollback()
             encoded = json.dumps(
                 {"message": "消息生成失败，请稍后重试。"},
@@ -145,17 +157,24 @@ async def delete_conversation(
     db: DbSession,
     owner_id: OwnerId,
 ) -> Response:
+    await service.require_conversation(
+        db,
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+    )
+    await media_service.delete_conversation_media(
+        db,
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+        settings=get_settings(),
+    )
     deleted = await repository.delete_conversation(
         db,
         conversation_id=conversation_id,
         owner_id=owner_id,
     )
     if not deleted:
-        await service.require_conversation(
-            db,
-            conversation_id=conversation_id,
-            owner_id=owner_id,
-        )
+        raise RuntimeError("conversation_delete_failed")
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

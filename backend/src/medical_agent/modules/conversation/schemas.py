@@ -1,8 +1,11 @@
 """Conversation API contracts."""
 
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from medical_agent.modules.media.schemas import MediaRead
 
 
 class ConversationCreate(BaseModel):
@@ -31,6 +34,7 @@ class MessageRead(BaseModel):
     status: str
     safety_code: str | None
     created_at: datetime
+    attachments: list[MediaRead] = Field(default_factory=lambda: list[MediaRead]())
 
 
 class ConversationDetail(ConversationRead):
@@ -38,7 +42,17 @@ class ConversationDetail(ConversationRead):
 
 
 class SendMessageRequest(BaseModel):
-    content: str = Field(min_length=1, max_length=4000)
+    content: str = Field(default="", max_length=4000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=4)
+    input_mode: Literal["text", "voice", "multimodal"] = "text"
+
+    @model_validator(mode="after")
+    def validate_content_or_attachments(self) -> "SendMessageRequest":
+        if not self.content.strip() and not self.attachment_ids:
+            raise ValueError("content_or_attachment_required")
+        if len(set(self.attachment_ids)) != len(self.attachment_ids):
+            raise ValueError("duplicate_attachment_ids")
+        return self
 
 
 class SendMessageResponse(BaseModel):

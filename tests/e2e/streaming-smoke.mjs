@@ -2,7 +2,8 @@ import { existsSync } from "node:fs";
 
 import { chromium } from "@playwright/test";
 
-const baseUrl = process.env.E2E_BASE_URL ?? "http://127.0.0.1:5173";
+const localProtocol = existsSync(".certs/dev-server.crt") ? "https" : "http";
+const baseUrl = process.env.E2E_BASE_URL ?? `${localProtocol}://127.0.0.1:5173`;
 const apiBaseUrl = process.env.E2E_API_BASE_URL ?? "/api/v1";
 const browserCandidates = [
   process.env.PLAYWRIGHT_EXECUTABLE_PATH,
@@ -14,7 +15,10 @@ const executablePath = browserCandidates.find((candidate) => existsSync(candidat
 const browser = await chromium.launch(executablePath ? { executablePath } : {});
 
 try {
-  const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    ignoreHTTPSErrors: true,
+  });
   const page = await context.newPage();
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.getByRole("button", { name: "第一次就诊前需要准备什么？" }).click();
