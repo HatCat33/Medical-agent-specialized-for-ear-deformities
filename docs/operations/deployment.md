@@ -65,8 +65,15 @@ Internet
 - 密钥管理、日志脱敏、监控告警和应急预案。
 - 将 `MEDIA_STORAGE_PATH` 放在持久化加密磁盘或授权对象存储中，并验证备份与删除流程。
 - 日志文件由 `LOG_FILE_PATH`、`LOG_MAX_BYTES` 和 `LOG_BACKUP_COUNT` 控制；生产环境应接入集中日志平台。
+- 问答追踪日志由 `INTERACTION_LOG_*` 控制并写入独立文件；如保存问答正文，必须加密存储、限制运维人员权限，并在集中日志平台中建立单独索引和保留策略。
 - 医院内容审核、安全评测、并发压测和合规确认。
 
 语音输入使用浏览器麦克风采集临时录音，需要 HTTPS 安全上下文（`localhost` 开发环境除外）。录音由后端调用 `ASR_*` 配置的转写服务，正式医院环境必须完成该服务的数据路径评审，或切换为医院批准的私有 ASR。
 
 `infra/compose/compose.prod.yaml` 当前只是生产配置占位，不能视为已完成的生产部署方案。
+
+## 知识管理端与数据库更新（2026-10-21）
+
+知识版本、chunk 编辑、后台向量任务及检索评测已接入管理端。使用步骤见 [知识管理手册](knowledge-admin.md)。当前后台任务执行器要求 API 单 worker，任务状态持久化在数据库中。
+
+独立 Docker PostgreSQL 部署及 SQLite 数据复制步骤见 [数据库迁移](postgres-migration.md)。生产环境请先执行 `uv run alembic upgrade head`；`APP_ENV=production` 不自动建表。

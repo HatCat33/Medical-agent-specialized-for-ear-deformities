@@ -24,9 +24,11 @@ class DemoChatProvider:
     async def stream(self, messages: list[ChatTurn]) -> AsyncIterator[str]:
         user_turn = next((item for item in reversed(messages) if item.role == "user"), None)
         question = user_turn.content if user_turn else ""
-        image_note = f"，并附带 {len(user_turn.images)} 张图片" if user_turn and user_turn.images else ""
+        image_note = (
+            f"，并附带 {len(user_turn.images)} 张图片" if user_turn and user_turn.images else ""
+        )
         content = (
-            "当前是第二版演示模式，会话、媒体历史和流式消息功能已经连通，"
+            "当前是第三版演示模式，会话、媒体历史、RAG 上下文和流式消息功能已经连通，"
             "但尚未配置支持视觉的正式模型，因此不会分析医学图片。"
             f"你本次输入的是：{question}{image_note}"
         )
@@ -61,9 +63,7 @@ class OpenAICompatibleProvider:
         api_key = self.vision_api_key if has_images else self.api_key
         model = self.vision_model if has_images else self.model
         max_tokens = self.vision_max_tokens if has_images else self.max_tokens
-        enable_thinking = (
-            self.vision_enable_thinking if has_images else self.enable_thinking
-        )
+        enable_thinking = self.vision_enable_thinking if has_images else self.enable_thinking
         if not base_url or not api_key or not model:
             raise ProviderError("model_not_configured")
         payload: dict[str, object] = {
@@ -76,15 +76,33 @@ class OpenAICompatibleProvider:
         if enable_thinking is not None:
             payload["enable_thinking"] = enable_thinking
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client, client.stream(
-                "POST",
-                f"{base_url}/chat/completions",
-                headers={
-                    "Accept": "text/event-stream",
-                    "Authorization": f"Bearer {api_key}",
-                },
-                json=payload,
-            ) as response:
+            async with (
+                httpx.AsyncClient(timeout=self.timeout) as client,
+                client.stream(
+                    "POST",
+                    f"{base_url}/chat/completions",
+                    headers={
+                        "Accept": "text/event-stream",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                    json=payload,
+                ) as response,
+            ):
+                if response.is_error:
+                    # Retain a bounded error body for protected admin diagnostics.
+                    # ProviderError itself still contains only a stable error code.
+                    body = bytearray()
+                    async for block in response.aiter_bytes():
+                        body.extend(block[: max(0, 16_384 - len(body))])
+                        if len(body) >= 16_384:
+                            break
+                    error_response = httpx.Response(
+                        response.status_code,
+                        headers=response.headers,
+                        content=bytes(body),
+                        request=response.request,
+                    )
+                    error_response.raise_for_status()
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line or line.startswith(":"):

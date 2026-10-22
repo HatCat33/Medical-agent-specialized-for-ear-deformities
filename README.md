@@ -1,6 +1,6 @@
 # 耳畸形专科医疗科普问答智能体
 
-面向医院患者及家属的耳畸形健康科普问答系统。当前第二版 `0.2.0` 已完成文本、图片、语音和历史会话的基础闭环，为后续接入医院审核后的知识库、RAG 及飞书/企业微信渠道做准备。
+面向医院患者及家属的耳畸形健康科普问答系统。当前第三版 `0.3.0` 在文本、图片、语音和历史会话基础上，加入医院 FAQ 的版本化 RAG 导入、混合检索、低召回降级和回答引用。
 
 > 本项目只提供健康科普信息，不能替代医生面诊、诊断或治疗建议。当前版本不是可直接承载真实患者数据的生产系统。
 
@@ -10,29 +10,37 @@
 
 - React 移动端 H5，支持桌面与手机浏览器。
 - 类豆包单行输入区；手机统一使用系统图片选择器，桌面端额外支持摄像头弹窗拍照。
-- 桌面历史侧栏可收起并记忆状态，移动端使用抽屉式历史会话。
-- FastAPI 会话接口与 SQLite 本地持久化。
+- 桌面历史侧栏可收起并记忆状态；移动端支持按钮或从左侧区域右滑，以 Push 推开方式进入历史会话，支持跟手拖动、左滑/点击遮罩返回。
+- FastAPI 会话接口与 SQLite / Docker PostgreSQL 持久化。
 - 新建、查看、删除历史会话，以及匿名访客隔离。
 - OpenAI-compatible Chat Completions 模型接入。
 - 从模型到浏览器的 SSE 流式输出、停止生成和部分回答保存。
 - Markdown 安全渲染，不执行模型返回的原始 HTML。
 - 单次最多四张 JPG、PNG、WebP、HEIC 或 HEIF 图片；手机系统统一提供拍照或相册来源，支持图片加文字的视觉问答。
 - 图片私有存储、访客归属校验、历史回看及随会话删除。
-- 按住录音、松开转写并自动发送，以及当前和历史回答的中文语音播报。
+- 按住录音、松开转写并自动发送；回答生成时按完整句流式播报，支持设备音色或兼容接口的云端 TTS。
 - 请求、媒体、会话和模型事件的结构化轮转日志。
+- 独立问答追踪日志，将输入、输出、模型、RAG 命中、耗时、状态及错误关联到同一次交互。
+- 医院 FAQ XLSX 只读校验、冲突检测、版本发布及关键词/可选向量混合检索。
+- 顶部导航管理端：运行总览、知识版本、chunk 查看/编辑/删除、XLSX 增量合并、后台向量任务、发布回退与操作记录。
+- 管理端检索实验与批量标注评测：默认从标准问题按分类均衡生成，支持命中率、Recall@K、MRR、无结果准确率、报告保存和导出。
+- 版本化提示词管理：系统与业务提示词均支持草稿、发布和历史回退，患者问答实时采用当前发布版本；独立医疗风险规则仍由安全模块执行。
+- 文本、视觉、ASR、Embedding 与浏览器 TTS 配置总览，以及显式手动模型探活；API Key 不返回管理端。
+- Docker PostgreSQL 部署、Alembic 结构迁移、SQLite 数据复制及逐表行数核对。
+- 检索上下文与生成模型解耦，后端保留知识来源关联供评测和排障，患者端不展示参考资料；低召回时可禁止通用模型补答。
 - 急症提示以及诊断、分型、处方和手术判定请求的基础边界控制。
 - 无模型配置时可运行的 `demo` 模式。
 
 尚未实现：
 
-- 医院 FAQ、PDF、视频转写内容的正式 RAG 检索与引用。
+- PDF、视频转写内容的解析、切分、审核和 RAG 检索。
+- 多级审核审批、独立管理员账户和角色权限。
 - 医院内网私有化 ASR、语音原文件历史和医生音色克隆播报。
 - 视频上传、转写和知识抽取。
 - 飞书、企业微信的事件回调、身份映射和正式上线配置。
-- 医院后台的知识审核、发布与回滚界面。
 - 生产级身份认证、限流、审计、数据保留与监控告警。
 
-详细范围见 [第一版产品范围](docs/product/v1-scope.md)、[第二版产品范围](docs/product/v2-scope.md) 和 [第二版发布记录](docs/releases/2026-10-18-v2.md)。
+详细范围见 [第三版发布记录](docs/releases/2026-10-22-v3.md)、[第三版 RAG 范围](docs/product/v3-rag-scope.md) 和 [RAG 架构说明](docs/architecture/rag.md)。
 
 ## 技术架构
 
@@ -45,16 +53,17 @@ React + Vite  ----SSE---->  FastAPI API
                               |-- conversation 会话与历史
                               |-- media 图片与授权读取
                               |-- speech 语音转写
-                              |-- providers 文本/视觉/ASR 适配层
-                              `-- SQLite + 私有媒体目录（开发验证）
+                              |-- knowledge FAQ 发布与混合检索
+                              |-- providers 文本/视觉/ASR/Embedding 适配层
+                              `-- SQLite 或 Docker PostgreSQL + 私有媒体目录
 
-后续：PostgreSQL + pgvector / Redis / 对象存储 / 异步任务
+后续：pgvector 原生近邻索引 / Redis 多进程任务队列 / 对象存储
 ```
 
 主要目录：
 
 - `apps/web-h5`：患者端问答与历史会话。
-- `apps/admin-web`：医院知识审核与运营后台预留。
+- `apps/admin-web`：顶部导航管理端，包含知识、评测、提示词和模型运维。
 - `backend`：FastAPI 模块化单体、模型适配器、迁移与测试。
 - `prompts`：版本化回答、安全、查询改写和医生风格提示词。
 - `evals`：脱敏评测集、规则、基线和报告。
@@ -130,13 +139,85 @@ ASR_LANGUAGE=
 
 文本与视觉模型服务需兼容 OpenAI Chat Completions 流式接口，ASR 服务需兼容 `POST /audio/transcriptions`。图片请求只会发送到独立配置的视觉模型；未配置 `VISION_*` 时图片仍会进入历史，但不会误发给纯文本模型。`VISION_ENABLE_THINKING` 只应为明确支持该参数的视觉模型配置。密钥只能保存在本地环境变量、服务器密钥管理服务或 CI Secret 中，禁止提交到 Git。
 
+## 导入医院 FAQ 并启用 RAG
+
+先在 `backend/.env` 中启用 RAG。Embedding 为可选配置；留空时使用本地关键词检索，配置后使用关键词与向量混合检索：
+
+```dotenv
+RAG_ENABLED=true
+RAG_TOP_K=4
+RAG_MIN_SCORE=0.16
+RAG_RELATIVE_SCORE=0.62
+RAG_REQUIRE_MATCH=true
+
+EMBEDDING_BASE_URL=https://your-provider.example/v1
+EMBEDDING_API_KEY=replace-me
+EMBEDDING_MODEL=replace-with-an-embedding-model
+```
+
+导入前先检查 FAQ，不会修改原 XLSX：
+
+```powershell
+cd F:\medical_agent\backend
+uv run python scripts/profile_faq_xlsx.py "C:\path\to\hospital-faq.xlsx"
+uv run python scripts/import_faq_rag.py "C:\path\to\hospital-faq.xlsx" --name "医院 FAQ 2026-10-22" --publish
+```
+
+如果 FAQ 已在配置 Embedding 前导入，可安全补全当前发布版本缺失的向量；命令可重复执行，已存在的向量不会重复计算：
+
+```powershell
+uv run python scripts/rebuild_faq_embeddings.py
+uv run python scripts/search_rag.py "第一次就诊需要准备什么？"
+```
+
+只有更换 Embedding 模型时才使用 `--rebuild-all`。该参数会覆盖当前版本的全部已有向量：
+
+```powershell
+uv run python scripts/rebuild_faq_embeddings.py --rebuild-all
+```
+
+如果存在同一问题对应不同答案，默认拒绝发布。完成医学审核后，可以修订原文件再导入；也可显式使用 `--exclude-conflicts` 排除冲突行并发布其余内容。医院 XLSX、数据库及检索索引不得提交到 Git。
+
+以后切换到自有微调模型时，只需让服务兼容 OpenAI Chat Completions，并替换 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_MODEL`。知识导入、检索、引用及安全模块无需重写。
+
+## 知识库管理端
+
+先在 `backend/.env` 设置独立管理员令牌并重启后端：
+
+```dotenv
+ADMIN_API_TOKEN=replace-with-a-long-random-token
+```
+
+再启动管理端：
+
+```powershell
+cd F:\medical_agent
+pnpm dev:admin -- --host 127.0.0.1
+```
+
+访问 `http://127.0.0.1:5174`，输入管理员令牌。顶部统一导航提供运行总览、知识版本、chunk 内容管理、检索评测、提示词管理、声音设置和任务记录。运行总览集中展示聊天、视觉、ASR、Embedding、TTS 与各自的探活按钮。知识建议流程：复制草稿 → 导入/编辑 → 补全向量 → 评测 → 发布。系统提示词和业务提示词一同版本化，草稿保存不生效，发布后新问答立即采用；独立医疗风险规则仍由安全模块执行。提示词和声音设置修改均校验现有 `ADMIN_API_TOKEN`，并写入系统操作审计。模型地址脱敏，不返回 API Key；探活必须手动触发，视觉与 ASR 测试可能产生少量供应商调用。全量向量重建只允许草稿；管理员令牌保存在当前标签页的 `sessionStorage`。
+
+已有数据库升级到本版时，在 `backend` 目录执行 `uv run python scripts/upgrade_database.py`，然后重新启动后端。SQLite 会先生成一致性备份；迁移兼容开发环境已创建声音设置表或上次迁移部分完成的状态，保留原提示词与已有设置。
+
+详细说明见 [知识管理手册](docs/operations/knowledge-admin.md) 与 [Docker PostgreSQL 迁移](docs/operations/postgres-migration.md)。当前任务执行器使用单 API worker，任务与评测结果持久化到数据库。
+
 ## 媒体与日志
 
 - 图片保存在 `MEDIA_STORAGE_PATH` 指定的私有目录，通过授权接口读取，不作为静态文件公开。
 - 图片类型根据文件内容校验，不只信任扩展名；默认最多 4 张、单张 5 MB、总计 16 MB。
 - 浏览器只负责临时录音，后端调用 `ASR_*` 配置的模型完成转写；原始麦克风音频默认不落盘，只保存转写后发送的文字。
-- 回答播报使用浏览器本机 TTS，不生成或保存音频文件。
+- 回答播报支持浏览器设备 TTS 或兼容接口的云端 TTS，不保存音频文件。新回答随模型流式输出按完整句尽早播报，云端音频按序预加载；顶部声音键记住静音偏好，历史消息不自动朗读。后台支持音色与播报参数、试听；云端通过 `TTS_*` 配置，支持填写供应商已创建的自定义/克隆音色 ID。创建或训练音色仍在供应商侧完成。部分手机浏览器需用户手势或音频权限才能播放。
 - 应用日志写入 `LOG_FILE_PATH`，默认单文件 10 MB、保留 10 个轮转文件，不记录问题正文、转写文字或图片内容。
+- 问答追踪日志写入 `INTERACTION_LOG_FILE_PATH`，默认是 `backend/logs/interactions.jsonl`；每行是一条完整 JSON 记录，可通过 `interaction_id`、`conversation_id` 和消息 ID 定位一次问答，并包含实际使用的提示词版本 ID 与校验值。
+- 如在 `backend/.env` 启用 `INTERACTION_LOG_INCLUDE_CONTENT=true`，问答追踪日志会保存用户文字和模型完整回答；图片只记录媒体 ID、类型和数量，不保存二进制内容，原始录音仍不落盘。模板默认关闭正文记录。
+- 生产环境应限制日志目录访问权限，并按医院要求设置 `INTERACTION_LOG_INCLUDE_CONTENT`、文件大小、轮转数量和销毁周期。关闭正文后仍保留长度、SHA-256、状态、耗时和错误信息。
+
+查看最近的问答追踪记录：
+
+```powershell
+cd F:\medical_agent\backend
+Get-Content .\logs\interactions.jsonl -Tail 20
+```
 
 ## 质量检查
 
@@ -165,7 +246,7 @@ pnpm test:e2e:voice
 
 - `main` 仅保存最终验收后的稳定版本，不直接开发。
 - 阶段分支格式为 `medical_agent_26_MM_DD`。
-- 当前第二版应用版本为 `0.2.0`，阶段分支为 `medical_agent_26_10_18`，发布标签为 `v26.10.18`。
+- 第三版版本为 `0.3.0`，阶段分支为 `medical_agent_26_10_22`，阶段标签为 `v26.10.22`；第二版稳定分支仍为 `medical_agent_26_10_18`。
 - 功能开发可使用 `feature/<name>`，完成后合并回对应阶段分支。
 
 详细规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。

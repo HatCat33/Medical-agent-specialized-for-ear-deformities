@@ -7,6 +7,7 @@ import {
   LoaderCircle,
   Menu,
   Mic,
+  SquarePen,
   Send,
   Sparkles,
   Square,
@@ -27,10 +28,18 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { api } from "../../lib/api";
+import { patientVisibleMarkdown } from "../../lib/markdown";
 import type { MediaAttachment, Message, SelectedImage } from "../../lib/types";
 import { CameraCapture } from "./CameraCapture";
+import { VoiceActivity } from "./VoiceActivity";
 
 interface ChatPanelProps {
+  onCreateConversation: () => void;
+  canCreateConversation: boolean;
+  autoSpeech: boolean;
+  playbackSupported: boolean;
+  playbackNotice: string;
+  onToggleSpeech: () => void;
   title: string;
   messages: Message[];
   value: string;
@@ -38,6 +47,8 @@ interface ChatPanelProps {
   processingImages: boolean;
   sending: boolean;
   listening: boolean;
+  recordingReady: boolean;
+  audioLevel: number;
   transcribing: boolean;
   speechSupported: boolean;
   error: string | null;
@@ -60,18 +71,6 @@ const suggestions = [
   "第一次就诊前需要准备什么？",
   "日常护理有哪些注意事项？",
 ];
-
-function plainTextFromMarkdown(value: string): string {
-  return value
-    .replace(/```[\s\S]*?```/g, "代码内容")
-    .replace(/!\[[^\]]*]\([^)]*\)/g, "")
-    .replace(/\[([^\]]+)]\([^)]*\)/g, "$1")
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/^\s*[-*>+]\s+/gm, "")
-    .replace(/[*_`~]/g, "")
-    .replace(/\n{2,}/g, "。")
-    .trim();
-}
 
 function SecureMessageImage({ attachment, index }: { attachment: MediaAttachment; index: number }) {
   const [source, setSource] = useState<string | null>(null);
@@ -124,6 +123,12 @@ function MessageAttachments({ attachments }: { attachments: MediaAttachment[] })
 }
 
 export function ChatPanel({
+  onCreateConversation,
+  canCreateConversation,
+  autoSpeech,
+  playbackSupported,
+  playbackNotice,
+  onToggleSpeech,
   title,
   messages,
   value,
@@ -131,6 +136,8 @@ export function ChatPanel({
   processingImages,
   sending,
   listening,
+  recordingReady,
+  audioLevel,
   transcribing,
   speechSupported,
   error,
@@ -153,10 +160,10 @@ export function ChatPanel({
   const shouldStickToBottom = useRef(true);
   const holdStartY = useRef<number | null>(null);
   const cancelGesture = useRef(false);
-  const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [voiceMode, setVoiceMode] = useState(false);
   const [showCancelHint, setShowCancelHint] = useState(false);
+  const [composerExpanded, setComposerExpanded] = useState(false);
 
   useEffect(() => {
     if (!shouldStickToBottom.current) return;
@@ -171,13 +178,18 @@ export function ChatPanel({
     const element = textareaRef.current;
     if (!element) return;
     element.style.height = "auto";
-    element.style.height = `${Math.min(element.scrollHeight, 132)}px`;
+    const styles = window.getComputedStyle(element);
+    const minHeight = Number.parseFloat(styles.minHeight) || 42;
+    const maxHeight = Number.parseFloat(styles.maxHeight) || 124;
+    const contentHeight = element.scrollHeight;
+    element.style.height = `${Math.min(Math.max(contentHeight, minHeight), maxHeight)}px`;
+    element.style.overflowY = contentHeight > maxHeight ? "auto" : "hidden";
+    setComposerExpanded(value.length > 0 && contentHeight > minHeight + 1);
   }, [value]);
 
   useEffect(() => {
     if (sending) shouldStickToBottom.current = true;
-    if (!sending && !transcribing && !voiceMode) textareaRef.current?.focus();
-  }, [sending, transcribing, voiceMode]);
+  }, [sending]);
 
   useEffect(
     () => () => {
@@ -197,26 +209,6 @@ export function ChatPanel({
       return;
     }
     setCameraOpen(true);
-  }
-
-  function toggleSpeech(message: Message) {
-    if (!("speechSynthesis" in window)) return;
-    window.speechSynthesis.cancel();
-    if (speakingMessageId === message.id) {
-      setSpeakingMessageId(null);
-      return;
-    }
-    const utterance = new SpeechSynthesisUtterance(plainTextFromMarkdown(message.content));
-    utterance.lang = "zh-CN";
-    utterance.rate = 1;
-    const chineseVoice = window.speechSynthesis
-      .getVoices()
-      .find((voice) => voice.lang.toLowerCase().startsWith("zh"));
-    if (chineseVoice) utterance.voice = chineseVoice;
-    utterance.onend = () => setSpeakingMessageId(null);
-    utterance.onerror = () => setSpeakingMessageId(null);
-    setSpeakingMessageId(message.id);
-    window.speechSynthesis.speak(utterance);
   }
 
   function beginHold(event?: PointerEvent<HTMLButtonElement> | KeyboardEvent<HTMLButtonElement>) {
@@ -260,18 +252,28 @@ export function ChatPanel({
 
   return (
     <section className="chat-shell">
-      <header
-        className="chat-header"
-        style={{ display: "flex", alignItems: "center", width: "100%" }}
-      >
-        <button
-          className="icon-button history-trigger"
-          type="button"
-          onClick={onOpenHistory}
-          title="历史会话"
-        >
-          <Menu size={20} />
-        </button>
+      <header className="chat-header">
+        <div className="chat-header-leading">
+          <button
+            className="icon-button history-trigger"
+            type="button"
+            onClick={onOpenHistory}
+            title="历史会话"
+            aria-label="打开历史会话"
+          >
+            <Menu size={23} />
+          </button>
+          <button
+            className="icon-button new-conversation-trigger"
+            type="button"
+            onClick={onCreateConversation}
+            disabled={!canCreateConversation}
+            title="新建会话"
+            aria-label="新建会话"
+          >
+            <SquarePen size={22} />
+          </button>
+        </div>
 
         <div
           className="chat-heading"
@@ -295,9 +297,12 @@ export function ChatPanel({
           <span>内容仅供健康科普</span>
         </div>
 
-        <div className="brand-mark" aria-hidden="true">
-          <Sparkles size={19} />
-        </div>
+        <button className={`icon-button auto-speech-toggle ${autoSpeech ? "is-enabled" : ""}`} type="button"
+          aria-label={autoSpeech ? "关闭自动播报" : "开启自动播报"} aria-pressed={autoSpeech}
+          disabled={!playbackSupported} onClick={onToggleSpeech}
+          title={!playbackSupported ? "当前浏览器不支持声音播报" : autoSpeech ? "关闭自动播报" : "开启自动播报"}>
+          {autoSpeech ? <Volume2 size={21} /> : <VolumeX size={21} />}
+        </button>
       </header>
 
       <div
@@ -331,7 +336,6 @@ export function ChatPanel({
                   onClick={() => {
                     setVoiceMode(false);
                     onSuggestion(suggestion);
-                    requestAnimationFrame(() => textareaRef.current?.focus());
                   }}
                 >
                   {suggestion}
@@ -343,38 +347,11 @@ export function ChatPanel({
           <div className="messages">
             {messages.map((message) => (
               <article className={`message-row ${message.role}`} key={message.id}>
-                {message.role === "assistant" && (
-                  <div className="message-avatar" aria-hidden="true">
-                    <Sparkles size={16} />
-                  </div>
-                )}
                 <div
                   className={`message-content ${
                     (message.attachments?.length ?? 0) > 0 ? "has-attachments" : ""
                   }`}
                 >
-                  <div className="message-meta">
-                    <span className="message-author">
-                      {message.role === "assistant" ? "科普助手" : "我"}
-                      {message.status === "streaming" && <small>正在生成</small>}
-                    </span>
-                    {message.role === "assistant" && message.content && (
-                      <button
-                        className="message-audio-button"
-                        type="button"
-                        onClick={() => toggleSpeech(message)}
-                        disabled={message.status === "streaming"}
-                        title={speakingMessageId === message.id ? "停止播报" : "播放回答"}
-                        aria-label={speakingMessageId === message.id ? "停止播报" : "播放回答"}
-                      >
-                        {speakingMessageId === message.id ? (
-                          <VolumeX size={15} />
-                        ) : (
-                          <Volume2 size={15} />
-                        )}
-                      </button>
-                    )}
-                  </div>
                   {message.status === "streaming" && !message.content ? (
                     <div className="typing" aria-label="正在生成回答">
                       <i />
@@ -387,10 +364,9 @@ export function ChatPanel({
                         message.status === "streaming" ? "is-streaming" : ""
                       }`}
                     >
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
-                      {message.status === "streaming" && (
-                        <span className="stream-cursor" aria-hidden="true" />
-                      )}
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {patientVisibleMarkdown(message.content)}
+                      </ReactMarkdown>
                     </div>
                   ) : (
                     <div className="user-message-bubble">
@@ -409,6 +385,8 @@ export function ChatPanel({
       </div>
 
       <footer className="composer-area">
+        {(listening || transcribing) && <VoiceActivity listening={listening} ready={recordingReady} transcribing={transcribing} cancelling={showCancelHint} level={audioLevel} />}
+        {playbackNotice && <div className="playback-notice" role="status">{playbackNotice}</div>}
         {error && (
           <div className="error-banner" role="alert">
             <AlertCircle size={16} />
@@ -432,13 +410,13 @@ export function ChatPanel({
                   </button>
                 </div>
               ))}
-              <span className="media-retention-note">图片随会话保存，删除会话时一并删除</span>
+              {/* <span className="media-retention-note">图片随会话保存，删除会话时一并删除</span> */}
             </div>
           )}
           <div
             className={`composer-row ${voiceMode ? "is-voice-mode" : ""} ${
               sending ? "is-sending" : ""
-            }`}
+            } ${!voiceMode && composerExpanded ? "is-expanded" : ""}`}
           >
             <input
               id={`${inputId}-images`}
@@ -544,17 +522,17 @@ export function ChatPanel({
                 {transcribing ? (
                   <>
                     <LoaderCircle className="spin" size={18} />
-                    正在识别...
+                    识别中
                   </>
                 ) : listening ? (
                   <>
                     <span className="recording-dot" aria-hidden="true" />
-                    {showCancelHint ? "松开取消" : "松开发送"}
+                    {showCancelHint ? "松开取消" : recordingReady ? "松开发送" : "开启麦克风中"}
                   </>
                 ) : (
                   <>
                     <Mic size={18} />
-                    按住说话
+                    {sending ? "正在回答" : "按住说话"}
                   </>
                 )}
               </button>

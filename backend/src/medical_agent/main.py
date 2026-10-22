@@ -13,6 +13,20 @@ from medical_agent.core.middleware import RequestContextMiddleware
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await init_db()
+    # The embedded job runner is for one API process. Recover interrupted jobs
+    # on startup; completed batches remain available for explicit retry.
+    from sqlalchemy import update
+
+    from medical_agent.core.database import session_factory
+    from medical_agent.modules.knowledge.models import KnowledgeOperation
+
+    async with session_factory() as db:
+        await db.execute(
+            update(KnowledgeOperation)
+            .where(KnowledgeOperation.active_slot.is_not(None))
+            .values(status="interrupted", active_slot=None, error="server_restarted_retry_required")
+        )
+        await db.commit()
     yield
     await close_db()
 
@@ -25,8 +39,12 @@ def create_app() -> FastAPI:
         file_path=settings.log_file_path,
         max_bytes=settings.log_max_bytes,
         backup_count=settings.log_backup_count,
+        interaction_enabled=settings.interaction_log_enabled,
+        interaction_file_path=settings.interaction_log_file_path,
+        interaction_max_bytes=settings.interaction_log_max_bytes,
+        interaction_backup_count=settings.interaction_log_backup_count,
     )
-    app = FastAPI(title="Medical Agent API", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="Medical Agent API", version="0.3.0", lifespan=lifespan)
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(
         CORSMiddleware,
@@ -46,4 +64,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-

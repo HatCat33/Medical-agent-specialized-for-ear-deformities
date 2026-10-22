@@ -77,9 +77,7 @@ async def transcribe_audio(upload: UploadFile, *, settings: Settings) -> str:
         unavailable = code == "asr_not_configured"
         raise HTTPException(
             status_code=(
-                status.HTTP_503_SERVICE_UNAVAILABLE
-                if unavailable
-                else status.HTTP_502_BAD_GATEWAY
+                status.HTTP_503_SERVICE_UNAVAILABLE if unavailable else status.HTTP_502_BAD_GATEWAY
             ),
             detail=code,
         ) from exc

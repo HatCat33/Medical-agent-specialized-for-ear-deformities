@@ -22,7 +22,6 @@ try {
   const page = await context.newPage();
   await page.goto(baseUrl, { waitUntil: "networkidle" });
   await page.getByRole("button", { name: "第一次就诊前需要准备什么？" }).click();
-  await page.getByRole("button", { name: "发送问题" }).click();
 
   const stopButton = page.getByRole("button", { name: "停止生成" });
   await stopButton.waitFor();

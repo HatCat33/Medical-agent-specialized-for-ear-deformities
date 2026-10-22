@@ -28,7 +28,7 @@ export function audioRecordingSupported(): boolean {
   );
 }
 
-export async function startAudioRecording(): Promise<AudioRecordingController> {
+export async function startAudioRecording(onLevel?: (level: number) => void): Promise<AudioRecordingController> {
   if (!audioRecordingSupported()) throw new Error("recording_not_supported");
 
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -52,6 +52,28 @@ export async function startAudioRecording(): Promise<AudioRecordingController> {
   }
 
   const chunks: Blob[] = [];
+  let audioContext: AudioContext | null = null;
+  let levelFrame = 0;
+  if (onLevel && typeof AudioContext !== "undefined") {
+    try {
+      audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser(); analyser.fftSize = 256;
+      source.connect(analyser);
+      void audioContext.resume().catch(() => undefined);
+      const samples = new Uint8Array(analyser.fftSize);
+      let lastUpdate = 0;
+      const measure = (time: number) => {
+        if (time - lastUpdate > 70) {
+          analyser.getByteTimeDomainData(samples);
+          const rms = Math.sqrt(samples.reduce((sum, value) => sum + ((value - 128) / 128) ** 2, 0) / samples.length);
+          onLevel(Math.min(1, rms * 5)); lastUpdate = time;
+        }
+        levelFrame = requestAnimationFrame(measure);
+      };
+      levelFrame = requestAnimationFrame(measure);
+    } catch { /* Recording stays available if the device cannot expose audio levels. */ }
+  }
   let cancelled = false;
   let settled = false;
   let resolveStopped: (file: File | null) => void = () => undefined;
@@ -60,6 +82,9 @@ export async function startAudioRecording(): Promise<AudioRecordingController> {
   });
 
   function releaseStream() {
+    cancelAnimationFrame(levelFrame);
+    if (audioContext && audioContext.state !== "closed") void audioContext.close().catch(() => undefined);
+    onLevel?.(0);
     stream.getTracks().forEach((track) => track.stop());
   }
 

@@ -1,14 +1,14 @@
 {
   "name": "@medical-agent/admin-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite --port 5174",
     "build": "tsc --noEmit && vite build",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.0.0",

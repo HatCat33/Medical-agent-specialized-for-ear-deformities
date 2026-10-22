@@ -14,7 +14,10 @@
     "test:e2e:visual": "node tests/e2e/visual-smoke.mjs",
     "test:e2e:stream": "node tests/e2e/streaming-smoke.mjs",
     "test:e2e:voice": "node tests/e2e/voice-input-smoke.mjs",
-    "test:e2e:markdown": "node tests/e2e/markdown-spacing-smoke.mjs"
+    "test:e2e:playback": "node tests/e2e/speech-playback-smoke.mjs",
+    "test:e2e:continuous-speech": "node tests/e2e/continuous-speech-smoke.mjs",
+    "test:e2e:markdown": "node tests/e2e/markdown-spacing-smoke.mjs",
+    "test:e2e:admin": "node tests/e2e/admin-smoke.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.0",

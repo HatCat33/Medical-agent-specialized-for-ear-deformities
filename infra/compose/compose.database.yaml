@@ -1,0 +1,23 @@
+name: medical-agent-db
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: medical_agent
+      POSTGRES_USER: medical_agent
+      # Local development only. Set POSTGRES_PASSWORD before exposing a deployment.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-medical_agent_local}
+    ports:
+      - "127.0.0.1:${MEDICAL_DB_PORT:-55432}:5432"
+    volumes:
+      - medical_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medical_agent -d medical_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  medical_postgres:

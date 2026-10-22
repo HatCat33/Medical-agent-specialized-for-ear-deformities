@@ -71,7 +71,8 @@ try {
           conversation_id: conversationId,
           sequence_no: 2,
           role: "assistant",
-          content: "就诊前可以整理既往检查资料和想咨询的问题。具体情况请由医生面诊评估。",
+          content:
+            "就诊前可以整理既往检查资料和想咨询的问题[1]。具体情况请由医生面诊评估。\n\n参考资料：\n- [1] 医院内部知识库 · 就诊准备",
           status: "completed",
           safety_code: "allowed",
           created_at: createdAt,
@@ -137,6 +138,50 @@ try {
     }
 
     await page.screenshot({ path: path.join(outputDir, `${target.name}-playwright.png`) });
+
+    const textarea = page.getByRole("textbox", { name: "咨询问题" });
+    const longQuestion = Array.from(
+      { length: 12 },
+      (_, index) => `第 ${index + 1} 条情况：请说明耳部护理和就诊时需要注意的事项。`,
+    ).join("\n");
+    await textarea.fill(longQuestion);
+    await page.locator(".composer-row.is-expanded").waitFor();
+    const longComposerLayout = await page.evaluate(() => {
+      const input = document.querySelector(".composer textarea");
+      const controls = [
+        document.querySelector(".media-picker"),
+        document.querySelector(".composer-mode-switch"),
+        document.querySelector(".send-button"),
+      ];
+      const camera = document.querySelector(".desktop-camera-button");
+      if (camera && getComputedStyle(camera).display !== "none") controls.push(camera);
+      const controlBottoms = controls.map((element) => element?.getBoundingClientRect().bottom ?? 0);
+      return {
+        viewportWidth: window.innerWidth,
+        pageWidth: document.documentElement.scrollWidth,
+        inputHeight: input?.clientHeight ?? 0,
+        inputScrollHeight: input?.scrollHeight ?? 0,
+        inputMaxHeight: input ? Number.parseFloat(getComputedStyle(input).maxHeight) : 0,
+        controlBottomSpread: Math.max(...controlBottoms) - Math.min(...controlBottoms),
+      };
+    });
+    if (longComposerLayout.pageWidth > longComposerLayout.viewportWidth) {
+      throw new Error(`${target.name} long composer has horizontal overflow: ${JSON.stringify(longComposerLayout)}`);
+    }
+    if (
+      longComposerLayout.inputHeight > longComposerLayout.inputMaxHeight + 1 ||
+      longComposerLayout.inputScrollHeight <= longComposerLayout.inputHeight
+    ) {
+      throw new Error(`${target.name} long composer textarea is not capped: ${JSON.stringify(longComposerLayout)}`);
+    }
+    if (longComposerLayout.controlBottomSpread > 2) {
+      throw new Error(`${target.name} long composer controls are not bottom-aligned: ${JSON.stringify(longComposerLayout)}`);
+    }
+    await page.screenshot({
+      path: path.join(outputDir, `${target.name}-long-composer-playwright.png`),
+    });
+    await textarea.fill("");
+    await page.locator(".composer-row.is-expanded").waitFor({ state: "detached" });
 
     const [imageChooser] = await Promise.all([
       page.waitForEvent("filechooser"),
@@ -241,6 +286,10 @@ try {
       await page.locator(".message-row.assistant .message-body").waitFor({
         timeout: 10000,
       });
+      const patientAnswer = await page.locator(".message-row.assistant .message-body").innerText();
+      if (patientAnswer.includes("参考资料") || patientAnswer.includes("[1]")) {
+        throw new Error(`mobile patient answer exposes internal references: ${patientAnswer}`);
+      }
       await page.locator(".message-images img").nth(1).waitFor();
       const loadedImages = await page.locator(".message-images img").evaluateAll((images) =>
         images.map((image) => ({

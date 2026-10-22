@@ -11,6 +11,8 @@ from typing import BinaryIO
 
 from openpyxl import load_workbook
 
+from medical_agent.modules.knowledge.schemas import FaqEntryInput
+
 REQUIRED_HEADERS = ("分类", "标准问题", "答案内容")
 OPTIONAL_HEADERS = ("其他问法", "有效日期")
 
@@ -161,3 +163,44 @@ def profile_faq_xlsx(source: str | Path | BinaryIO) -> FaqProfile:
         invalid_effective_date_rows=invalid_effective_date_rows,
         warnings=warnings,
     )
+
+
+def parse_faq_xlsx(source: str | Path | BinaryIO) -> tuple[list[FaqEntryInput], FaqProfile]:
+    """Parse valid FAQ rows without mutating the hospital workbook."""
+    profile = profile_faq_xlsx(source)
+    if profile.missing_required_headers:
+        raise ValueError("faq_required_headers_missing")
+    workbook = load_workbook(source, read_only=True, data_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    rows = sheet.iter_rows(values_only=True)
+    headers = [_normalize_text(value) for value in next(rows)]
+    index = {header: position for position, header in enumerate(headers) if header}
+    entries: list[FaqEntryInput] = []
+    for row_number, row in enumerate(rows, start=2):
+        if not any(value not in (None, "") for value in row):
+            continue
+        category = _normalize_text(row[index["分类"]])
+        question = _normalize_text(row[index["标准问题"]])
+        answer = _normalize_text(row[index["答案内容"]])
+        if not category or not question or not answer:
+            continue
+        aliases = ""
+        alias_index = index.get("其他问法")
+        if alias_index is not None and alias_index < len(row):
+            aliases = _normalize_text(row[alias_index])
+        effective_date = ""
+        effective_index = index.get("有效日期")
+        if effective_index is not None and effective_index < len(row):
+            effective_date = _normalize_text(row[effective_index])
+        entries.append(
+            FaqEntryInput(
+                category=category,
+                question=question,
+                aliases=aliases,
+                answer=answer,
+                effective_date=effective_date,
+                source_sheet=sheet.title,
+                source_row=row_number,
+            )
+        )
+    return entries, profile

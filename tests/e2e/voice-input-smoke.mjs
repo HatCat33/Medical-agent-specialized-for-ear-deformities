@@ -39,6 +39,7 @@ try {
       throw new Error("Speech request did not contain recorded multipart audio.");
     }
     transcriptionRequests += 1;
+    await page.waitForTimeout(600);
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -113,6 +114,8 @@ try {
   await page.screenshot({ path: path.join(outputDir, "mobile-voice-recording-playwright.png") });
   await page.mouse.up();
 
+  await page.getByText("正在识别语音", { exact: true }).waitFor();
+  await page.screenshot({ path: path.join(outputDir, "mobile-voice-recognizing-playwright.png") });
   await page.locator(".message-row.user", { hasText: "语音输入测试问题" }).waitFor({
     timeout: 15000,
   });

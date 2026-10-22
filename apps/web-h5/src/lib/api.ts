@@ -158,6 +158,15 @@ async function streamMessage(
 }
 
 export const api = {
+  synthesizeSpeech: async (text: string, signal: AbortSignal): Promise<Blob> => {
+    const response = await fetch(`${API_BASE}/speech/syntheses`, {
+      method: "POST", signal, headers: { "Content-Type": "application/json", "X-Visitor-ID": visitorId() },
+      body: JSON.stringify({ text }),
+    });
+    if (!response.ok) throw new Error("speech_synthesis_failed");
+    return response.blob();
+  },
+  speechSettings: <T>() => request<T>("/speech/settings"),
   listConversations: () => request<Conversation[]>("/conversations"),
   createConversation: () =>
     request<Conversation>("/conversations", {

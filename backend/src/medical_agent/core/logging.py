@@ -1,10 +1,18 @@
-"""Structured console and rotating-file logs without request or media bodies."""
+"""Structured operational and access-controlled interaction logs."""
 
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import structlog
+
+INTERACTION_LOGGER_NAME = "medical_agent.interactions"
+
+
+def _close_handlers(logger: logging.Logger) -> None:
+    for handler in logger.handlers:
+        handler.close()
+    logger.handlers.clear()
 
 
 def configure_logging(
@@ -14,6 +22,10 @@ def configure_logging(
     file_path: str,
     max_bytes: int,
     backup_count: int,
+    interaction_enabled: bool,
+    interaction_file_path: str,
+    interaction_max_bytes: int,
+    interaction_backup_count: int,
 ) -> None:
     resolved_level = getattr(logging, level.upper(), logging.INFO)
     shared_processors: list[structlog.types.Processor] = [
@@ -63,12 +75,40 @@ def configure_logging(
         handlers.append(file_handler)
 
     root_logger = logging.getLogger()
-    root_logger.handlers.clear()
+    _close_handlers(root_logger)
     root_logger.setLevel(resolved_level)
     for handler in handlers:
         handler.setLevel(resolved_level)
         root_logger.addHandler(handler)
 
+    interaction_logger = logging.getLogger(INTERACTION_LOGGER_NAME)
+    _close_handlers(interaction_logger)
+    interaction_logger.setLevel(logging.INFO)
+    interaction_logger.propagate = False
+    if interaction_enabled and interaction_file_path:
+        interaction_target = Path(interaction_file_path).resolve()
+        interaction_target.parent.mkdir(parents=True, exist_ok=True)
+        interaction_handler = RotatingFileHandler(
+            interaction_target,
+            maxBytes=interaction_max_bytes,
+            backupCount=interaction_backup_count,
+            encoding="utf-8",
+        )
+        interaction_handler.setLevel(logging.INFO)
+        interaction_handler.setFormatter(
+            structlog.stdlib.ProcessorFormatter(
+                processor=structlog.processors.JSONRenderer(ensure_ascii=False),
+                foreign_pre_chain=shared_processors,
+            )
+        )
+        interaction_logger.addHandler(interaction_handler)
+    else:
+        interaction_logger.addHandler(logging.NullHandler())
+
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     return structlog.stdlib.get_logger(name)
+
+
+def get_interaction_logger() -> structlog.stdlib.BoundLogger:
+    return get_logger(INTERACTION_LOGGER_NAME)

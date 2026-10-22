@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ChatPanel } from "../features/chat/ChatPanel";
+import { useAnswerSpeech } from "../features/chat/useAnswerSpeech";
 import { HistorySidebar } from "../features/history/HistorySidebar";
 import { api } from "../lib/api";
 import { prepareImageForUpload } from "../lib/image";
@@ -42,6 +43,8 @@ function readableTranscriptionError(error: unknown): string {
 }
 
 export function App() {
+  const speech = useAnswerSpeech();
+  const playback = speech.playback;
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -51,9 +54,13 @@ export function App() {
   const [processingImages, setProcessingImages] = useState(false);
   const [sending, setSending] = useState(false);
   const [listening, setListening] = useState(false);
+  const [recordingReady, setRecordingReady] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
   const [transcribing, setTranscribing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const historyOpenRef = useRef(false);
+  const appShellRef = useRef<HTMLElement>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
     () => localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true",
   );
@@ -63,6 +70,104 @@ export function App() {
   const recordingReleasePending = useRef(false);
   const recordingTimer = useRef<number | null>(null);
   const previewUrls = useRef(new Set<string>());
+  const conversationCreation = useRef<Promise<Conversation> | null>(null);
+
+  useEffect(() => {
+    historyOpenRef.current = historyOpen;
+  }, [historyOpen]);
+
+  useEffect(() => {
+    let startX = 0;
+    let startY = 0;
+    let lastX = 0;
+    let lastTime = 0;
+    let velocityX = 0;
+    let dragOffset = 0;
+    let gesture: "pending" | "horizontal" | "vertical" = "pending";
+    let eligible = false;
+
+    const sidebarWidth = () => Math.min(window.innerWidth * 0.86, 320);
+    const updateDrag = (clientX: number) => {
+      const shell = appShellRef.current;
+      if (!shell) return;
+      const width = sidebarWidth();
+      const baseOffset = historyOpenRef.current ? width : 0;
+      dragOffset = Math.min(width, Math.max(0, baseOffset + clientX - startX));
+      shell.style.setProperty("--mobile-history-offset", `${dragOffset}px`);
+      shell.style.setProperty("--mobile-history-progress", String(dragOffset / width));
+    };
+    const finishDrag = () => {
+      if (gesture !== "horizontal") return;
+      const shell = appShellRef.current;
+      const width = sidebarWidth();
+      const projectedOffset = dragOffset + velocityX * 140;
+      const shouldOpen = projectedOffset >= width * 0.5;
+      historyOpenRef.current = shouldOpen;
+      shell?.classList.toggle("is-history-open", shouldOpen);
+      setHistoryOpen(shouldOpen);
+      window.requestAnimationFrame(() => {
+        shell?.classList.remove("is-history-dragging");
+        shell?.style.removeProperty("--mobile-history-offset");
+        shell?.style.removeProperty("--mobile-history-progress");
+      });
+    };
+    const onTouchStart = (event: TouchEvent) => {
+      if (!window.matchMedia("(max-width: 760px)").matches || event.touches.length !== 1) return;
+      const touch = event.touches[0];
+      startX = touch.clientX;
+      startY = touch.clientY;
+      lastX = touch.clientX;
+      lastTime = performance.now();
+      velocityX = 0;
+      dragOffset = historyOpenRef.current ? sidebarWidth() : 0;
+      gesture = "pending";
+      eligible = historyOpenRef.current || startX <= Math.min(window.innerWidth * 0.45, 180);
+    };
+    const onTouchMove = (event: TouchEvent) => {
+      if (!eligible || !window.matchMedia("(max-width: 760px)").matches || event.touches.length !== 1) return;
+      const touch = event.touches[0];
+      const deltaX = touch.clientX - startX;
+      const deltaY = touch.clientY - startY;
+      if (gesture === "pending" && Math.max(Math.abs(deltaX), Math.abs(deltaY)) >= 8) {
+        gesture = Math.abs(deltaX) > Math.abs(deltaY) * 1.15 ? "horizontal" : "vertical";
+        if (gesture === "horizontal") appShellRef.current?.classList.add("is-history-dragging");
+      }
+      if (gesture !== "horizontal") return;
+      if (event.cancelable) event.preventDefault();
+      const now = performance.now();
+      const elapsed = now - lastTime;
+      if (elapsed > 0) {
+        const instantVelocity = (touch.clientX - lastX) / elapsed;
+        velocityX = velocityX * 0.65 + instantVelocity * 0.35;
+      }
+      lastX = touch.clientX;
+      lastTime = now;
+      updateDrag(touch.clientX);
+    };
+    const onTouchEnd = (event: TouchEvent) => {
+      if (!event.changedTouches.length) return;
+      if (gesture === "horizontal") updateDrag(event.changedTouches[0].clientX);
+      finishDrag();
+      gesture = "pending";
+      eligible = false;
+    };
+    const onTouchCancel = () => {
+      velocityX = 0;
+      finishDrag();
+      gesture = "pending";
+      eligible = false;
+    };
+    document.addEventListener("touchstart", onTouchStart, { passive: true });
+    document.addEventListener("touchmove", onTouchMove, { passive: false });
+    document.addEventListener("touchend", onTouchEnd, { passive: true });
+    document.addEventListener("touchcancel", onTouchCancel, { passive: true });
+    return () => {
+      document.removeEventListener("touchstart", onTouchStart);
+      document.removeEventListener("touchmove", onTouchMove);
+      document.removeEventListener("touchend", onTouchEnd);
+      document.removeEventListener("touchcancel", onTouchCancel);
+    };
+  }, []);
 
   const clearSelectedImages = useCallback(() => {
     setSelectedImages((current) => {
@@ -82,6 +187,7 @@ export function App() {
     recordingController.current?.cancel();
     recordingController.current = null;
     setListening(false);
+    setRecordingReady(false); setAudioLevel(0);
   }, []);
 
   useEffect(
@@ -103,6 +209,7 @@ export function App() {
 
   const openConversation = useCallback(
     async (conversationId: string) => {
+      playback.cancel();
       setError(null);
       setInput("");
       setInputMode("text");
@@ -113,7 +220,7 @@ export function App() {
       const detail = await api.getConversation(conversationId);
       setMessages(detail.messages);
     },
-    [cancelRecording, clearSelectedImages],
+    [cancelRecording, clearSelectedImages, playback],
   );
 
   useEffect(() => {
@@ -128,18 +235,30 @@ export function App() {
   }, [openConversation, refreshConversations]);
 
   async function createConversation(preserveComposer = false): Promise<Conversation> {
+    if (conversationCreation.current) return conversationCreation.current;
+    if (!preserveComposer && activeId && messages.length === 0) {
+      const current = conversations.find((item) => item.id === activeId);
+      if (current) return current;
+    }
     if (!preserveComposer) {
+      playback.cancel();
       setInput("");
       setInputMode("text");
       cancelRecording();
       clearSelectedImages();
     }
-    const conversation = await api.createConversation();
-    setConversations((current) => [conversation, ...current]);
-    setActiveId(conversation.id);
-    setMessages([]);
-    setHistoryOpen(false);
-    return conversation;
+    const request = api.createConversation();
+    conversationCreation.current = request;
+    try {
+      const conversation = await request;
+      setConversations((current) => [conversation, ...current]);
+      setActiveId(conversation.id);
+      setMessages([]);
+      setHistoryOpen(false);
+      return conversation;
+    } finally {
+      conversationCreation.current = null;
+    }
   }
 
   async function deleteConversation(conversationId: string) {
@@ -149,6 +268,7 @@ export function App() {
       const remaining = conversations.filter((item) => item.id !== conversationId);
       setConversations(remaining);
       if (activeId === conversationId) {
+        playback.cancel();
         if (remaining[0]) await openConversation(remaining[0].id);
         else {
           setActiveId(null);
@@ -212,18 +332,22 @@ export function App() {
 
   async function startVoiceRecording() {
     if (sending || transcribing || listening) return;
+    playback.cancel();
     const attempt = recordingAttempt.current + 1;
     recordingAttempt.current = attempt;
     recordingReleasePending.current = false;
     setError(null);
     setListening(true);
     try {
-      const controller = await startAudioRecording();
+      const controller = await startAudioRecording(level => {
+        if (recordingAttempt.current === attempt) setAudioLevel(level);
+      });
       if (recordingAttempt.current !== attempt) {
         controller.cancel();
         return;
       }
       recordingController.current = controller;
+      setRecordingReady(true);
       recordingTimer.current = window.setTimeout(() => {
         void finishVoiceRecording(controller);
       }, MAX_RECORDING_MS);
@@ -246,6 +370,7 @@ export function App() {
     if (recordingTimer.current !== null) window.clearTimeout(recordingTimer.current);
     recordingTimer.current = null;
     setListening(false);
+    setRecordingReady(false); setAudioLevel(0);
     setTranscribing(true);
     setError(null);
     try {
@@ -260,6 +385,7 @@ export function App() {
         setError("没有识别到语音，请重试。");
         return;
       }
+      setTranscribing(false);
       await submitMessage({
         content,
         inputMode: selectedImages.length ? "multimodal" : "voice",
@@ -281,6 +407,7 @@ export function App() {
     const content = (options?.content ?? input).trim();
     const files = selectedImages.map((item) => item.file);
     if ((!content && !files.length) || sending || processingImages) return;
+    playback.begin();
     cancelRecording();
     setSending(true);
     setError(null);
@@ -342,6 +469,7 @@ export function App() {
             );
           },
           onDelta: (chunk) => {
+            playback.append(chunk);
             setMessages((current) =>
               current.map((item) =>
                 item.id === assistantTemporaryId
@@ -351,6 +479,7 @@ export function App() {
             );
           },
           onDone: (message) => {
+            playback.finish();
             setMessages((current) =>
               current.map((item) => (item.id === assistantTemporaryId ? message : item)),
             );
@@ -359,6 +488,7 @@ export function App() {
         controller.signal,
       );
     } catch (caught) {
+      playback.cancel();
       const stopped = caught instanceof DOMException && caught.name === "AbortError";
       if (!userPersisted) {
         setMessages((current) =>
@@ -378,7 +508,9 @@ export function App() {
           }),
         );
       }
-      if (!stopped) setError("连接中断，已保留成功保存的内容，请稍后重试。");
+      if (!stopped) setError(userPersisted
+        ? "回答连接中断，已保留发送成功的内容，请稍后重试。"
+        : "暂时无法发送，输入内容已保留，请稍后重试。");
     } finally {
       streamController.current = null;
       setSending(false);
@@ -391,18 +523,19 @@ export function App() {
   }
 
   function stopGeneration() {
+    playback.cancel();
     streamController.current?.abort();
   }
 
   const active = conversations.find((item) => item.id === activeId);
 
   return (
-    <main className={`app-shell ${sidebarCollapsed ? "is-sidebar-collapsed" : ""}`}>
-      <div
-        className={`sidebar-backdrop ${historyOpen ? "is-open" : ""}`}
-        onClick={() => setHistoryOpen(false)}
-        aria-hidden="true"
-      />
+    <main
+      ref={appShellRef}
+      className={`app-shell ${sidebarCollapsed ? "is-sidebar-collapsed" : ""} ${
+        historyOpen ? "is-history-open" : ""
+      }`}
+    >
       <HistorySidebar
         conversations={conversations}
         activeId={activeId}
@@ -421,7 +554,22 @@ export function App() {
         onSelect={(conversationId) => void openConversation(conversationId)}
         onDelete={(conversationId) => void deleteConversation(conversationId)}
       />
+      <button
+        className="mobile-history-dismiss"
+        type="button"
+        aria-label="返回对话"
+        onClick={() => {
+          historyOpenRef.current = false;
+          setHistoryOpen(false);
+        }}
+      />
       <ChatPanel
+        onCreateConversation={() => void createConversation()}
+        canCreateConversation={!sending && !listening && !transcribing && !processingImages}
+        autoSpeech={speech.enabled}
+        playbackSupported={speech.supported}
+        playbackNotice={speech.notice}
+        onToggleSpeech={speech.toggle}
         title={active?.title ?? "新会话"}
         messages={messages}
         value={input}
@@ -429,6 +577,8 @@ export function App() {
         processingImages={processingImages}
         sending={sending}
         listening={listening}
+        recordingReady={recordingReady}
+        audioLevel={audioLevel}
         transcribing={transcribing}
         speechSupported={audioRecordingSupported()}
         error={error}
@@ -459,8 +609,10 @@ export function App() {
         onStop={stopGeneration}
         onOpenHistory={() => setHistoryOpen(true)}
         onSuggestion={(value) => {
-          setInput(value);
-          setInputMode(selectedImages.length ? "multimodal" : "text");
+          void submitMessage({
+            content: value,
+            inputMode: selectedImages.length ? "multimodal" : "text",
+          });
         }}
       />
     </main>
