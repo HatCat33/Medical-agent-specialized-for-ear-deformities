@@ -164,8 +164,14 @@ async def current_runtime_prompt(db: AsyncSession) -> tuple[str, str | None, str
     return row.system_content + "\n\n" + row.content, row.id, row.checksum
 
 
-def assemble_system_prompt(business_prompt: str, knowledge_context: str = "") -> str:
+def assemble_system_prompt(
+    business_prompt: str,
+    knowledge_context: str = "",
+    conversation_memory: str = "",
+) -> str:
     sections = [business_prompt.strip()]
+    if conversation_memory:
+        sections.append(conversation_memory.strip())
     if knowledge_context:
         sections.append(knowledge_context.strip())
     return "\n\n".join(section for section in sections if section)

@@ -28,5 +28,6 @@ medical_agent/
 - 语音转写、合成和声音设置由 `modules/speech` 暴露，外部服务通过兼容接口适配。
 - 版本化系统/业务提示词、模型配置展示、分层探活和操作审计由 `modules/system` 管理；确定性的医疗安全判断保留在 `modules/safety`。
 - 飞书、企微等渠道对象只存在于 `modules/channels`，进入会话层前转换为内部契约。
+- 企业微信 API 模式的长连接、帧协议和媒体解密位于 `modules/channels/wecom`；微信客服的加密回调、消息同步和媒体下载位于 `modules/channels/wechat_kf`；渠道身份映射、事件去重和同步游标位于 `modules/channels/common`。
 - 运行数据、医院资料、患者数据、密钥、日志、数据库和上传媒体不进入 Git。
 

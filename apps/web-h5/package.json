@@ -1,7 +1,7 @@
 {
   "name": "@medical-agent/web-h5",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

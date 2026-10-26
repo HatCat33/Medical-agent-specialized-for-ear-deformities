@@ -28,7 +28,7 @@ class DemoChatProvider:
             f"，并附带 {len(user_turn.images)} 张图片" if user_turn and user_turn.images else ""
         )
         content = (
-            "当前是第三版演示模式，会话、媒体历史、RAG 上下文和流式消息功能已经连通，"
+            "当前是 Demo 测试模式，会话、媒体历史、RAG 上下文和流式消息功能已经连通，"
             "但尚未配置支持视觉的正式模型，因此不会分析医学图片。"
             f"你本次输入的是：{question}{image_note}"
         )

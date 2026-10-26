@@ -5,6 +5,7 @@ import hashlib
 import time
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from weakref import WeakValueDictionary
 
 from fastapi import HTTPException, status
@@ -13,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from medical_agent.core.config import Settings, get_settings
 from medical_agent.core.database import session_factory
 from medical_agent.core.logging import get_interaction_logger, get_logger
-from medical_agent.modules.conversation import repository
+from medical_agent.modules.conversation import repository, summarizer
 from medical_agent.modules.conversation.models import Conversation, Message
 from medical_agent.modules.knowledge import service as knowledge_service
 from medical_agent.modules.knowledge.schemas import RetrievalHit
@@ -23,7 +24,7 @@ from medical_agent.modules.safety.schemas import SafetyDecision
 from medical_agent.modules.safety.service import evaluate_user_input
 from medical_agent.modules.system import prompt_service
 from medical_agent.providers.llm.client import ProviderError, build_chat_provider
-from medical_agent.providers.llm.protocol import ChatTurn, ImageInput
+from medical_agent.providers.llm.protocol import ChatProvider, ChatTurn, ImageInput
 
 logger = get_logger(__name__)
 interaction_logger = get_interaction_logger()
@@ -91,11 +92,12 @@ def _record_interaction(
     transport: str,
     prompt_release_id: str | None,
     prompt_checksum: str,
+    model_image_count: int = 0,
     error_code: str | None = None,
 ) -> None:
     if not settings.interaction_log_enabled:
         return
-    has_images = bool(attachments)
+    has_images = model_image_count > 0
     model_name = settings.vision_model if has_images else settings.llm_model
     fields: dict[str, object] = {
         "interaction_id": interaction_id,
@@ -106,12 +108,15 @@ def _record_interaction(
         "transport": transport,
         "input_mode": input_mode,
         "attachment_count": len(attachments),
+        "model_image_count": model_image_count,
         "attachment_ids": [attachment.id for attachment in attachments],
         "media_types": [attachment.media_type for attachment in attachments],
         "provider": settings.llm_provider,
         "model": model_name or ("demo" if settings.llm_provider == "demo" else "unconfigured"),
         "prompt_release_id": prompt_release_id,
         "prompt_checksum": prompt_checksum,
+        "memory_through_sequence": conversation.memory_through_sequence,
+        "memory_summary_length": len(conversation.memory_summary),
         "rag_enabled": settings.rag_enabled,
         "rag_hit_count": len(knowledge_hits),
         "rag_hits": [
@@ -148,22 +153,147 @@ def _record_interaction(
 def _chat_turns(
     recent: list[Message],
     *,
-    current_message_id: str,
-    images: tuple[ImageInput, ...],
+    images_by_message: dict[str, tuple[ImageInput, ...]],
     business_prompt: str,
     knowledge_context: str = "",
+    conversation_memory: str = "",
 ) -> list[ChatTurn]:
-    system_content = prompt_service.assemble_system_prompt(business_prompt, knowledge_context)
-    turns = [ChatTurn(role="system", content=system_content)]
-    turns.extend(
-        ChatTurn(
-            role=item.role,
-            content=item.content,
-            images=images if item.id == current_message_id else (),
-        )
-        for item in recent
+    system_content = prompt_service.assemble_system_prompt(
+        business_prompt,
+        knowledge_context,
+        conversation_memory,
     )
+    turns = [ChatTurn(role="system", content=system_content)]
+    for item in recent:
+        images = images_by_message.get(item.id, ())
+        content = item.content
+        if images:
+            content += (
+                f"\n\n[会话图片上下文：此条用户消息附带 {len(images)} 张图片，"
+                "顺序与用户上传顺序一致。]"
+            )
+        turns.append(ChatTurn(role=item.role, content=content, images=images))
     return turns
+
+
+async def _conversation_image_context(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    current_message_id: str,
+    current_images: tuple[ImageInput, ...],
+    settings: Settings,
+) -> tuple[dict[str, tuple[ImageInput, ...]], list[Message]]:
+    """Load recent images from the whole current conversation, not just the text window."""
+    context: dict[str, tuple[ImageInput, ...]] = {}
+    if current_images:
+        context[current_message_id] = current_images
+    if settings.history_image_limit == 0 or settings.history_image_max_total_bytes == 0:
+        return context, []
+
+    selected: list[tuple[Message, MediaObject]] = []
+    selected_bytes = 0
+    image_rows = await repository.list_attached_images(
+        db,
+        conversation_id=conversation_id,
+    )
+    for message, attachment in image_rows:
+        if message.id == current_message_id:
+            continue
+        if len(selected) >= settings.history_image_limit:
+            break
+        if selected_bytes + attachment.size_bytes > settings.history_image_max_total_bytes:
+            continue
+        selected.append((message, attachment))
+        selected_bytes += attachment.size_bytes
+
+    by_message: dict[str, list[MediaObject]] = {}
+    messages_by_id: dict[str, Message] = {}
+    for message, attachment in reversed(selected):
+        by_message.setdefault(message.id, []).append(attachment)
+        messages_by_id[message.id] = message
+    for message_id, attachments in by_message.items():
+        try:
+            context[message_id] = await media_service.load_image_inputs(
+                attachments,
+                settings=settings,
+            )
+        except HTTPException:
+            logger.warning(
+                "conversation_history_image_unavailable",
+                message_id=message_id,
+                attachment_count=len(attachments),
+            )
+
+    if selected:
+        logger.info(
+            "conversation_history_images_loaded",
+            image_count=sum(len(images) for key, images in context.items() if key != current_message_id),
+            total_bytes=selected_bytes,
+        )
+    image_messages = sorted(messages_by_id.values(), key=lambda item: item.sequence_no)
+    return context, image_messages
+
+
+async def _model_context(
+    db: AsyncSession,
+    *,
+    conversation: Conversation,
+    current_message: Message,
+    current_images: tuple[ImageInput, ...],
+    provider: ChatProvider,
+    settings: Settings,
+) -> tuple[list[Message], dict[str, tuple[ImageInput, ...]], str]:
+    recent = await repository.list_messages(
+        db,
+        conversation_id=conversation.id,
+        limit=settings.history_message_limit,
+    )
+    oldest_recent_sequence = recent[0].sequence_no if recent else current_message.sequence_no + 1
+    pending = await repository.list_messages_between(
+        db,
+        conversation_id=conversation.id,
+        after_sequence=conversation.memory_through_sequence,
+        before_sequence=oldest_recent_sequence,
+    )
+
+    if len(pending) >= settings.history_summary_batch_size:
+        try:
+            conversation.memory_summary = await summarizer.update_summary(
+                provider,
+                previous_summary=conversation.memory_summary,
+                messages=pending,
+                max_chars=settings.history_summary_max_chars,
+            )
+            conversation.memory_through_sequence = pending[-1].sequence_no
+            conversation.memory_updated_at = datetime.now(UTC)
+            pending = []
+            await db.flush()
+            logger.info(
+                "conversation_memory_updated",
+                conversation_id=conversation.id,
+                through_sequence=conversation.memory_through_sequence,
+                summary_length=len(conversation.memory_summary),
+            )
+        except (ProviderError, ValueError) as exc:
+            logger.warning(
+                "conversation_memory_update_failed",
+                conversation_id=conversation.id,
+                pending_message_count=len(pending),
+                error_type=type(exc).__name__,
+            )
+
+    images_by_message, image_messages = await _conversation_image_context(
+        db,
+        conversation_id=conversation.id,
+        current_message_id=current_message.id,
+        current_images=current_images,
+        settings=settings,
+    )
+    # Pending unsummarized messages stay verbatim, so batching never creates a memory gap.
+    messages_by_id = {item.id: item for item in [*pending, *recent, *image_messages]}
+    messages = sorted(messages_by_id.values(), key=lambda item: item.sequence_no)
+    return messages, images_by_message, summarizer.memory_prompt(conversation.memory_summary)
 
 
 async def _prepare_user_message(
@@ -248,6 +378,7 @@ async def send_message(
     content: str,
     attachment_ids: list[str] | None = None,
     input_mode: str = "text",
+    transport: str = "request_response",
 ) -> tuple[Message, Message]:
     async with _conversation_lock(conversation.id):
         started = time.perf_counter()
@@ -265,6 +396,7 @@ async def send_message(
             settings=settings,
         )
         images = await media_service.load_image_inputs(attachments, settings=settings)
+        model_image_count = len(images)
 
         decision = evaluate_user_input(normalized_content)
         knowledge_hits: list[RetrievalHit] = []
@@ -279,24 +411,33 @@ async def send_message(
                     query=normalized_content,
                     settings=settings,
                 )
-            recent = await repository.list_messages(
-                db,
-                conversation_id=conversation.id,
-                limit=settings.history_message_limit,
-            )
             provider = build_chat_provider(settings)
-            if settings.rag_enabled and settings.rag_require_match and not knowledge_hits and not images:
+            model_messages, images_by_message, conversation_memory = await _model_context(
+                db,
+                conversation=conversation,
+                current_message=user_message,
+                current_images=images,
+                provider=provider,
+                settings=settings,
+            )
+            model_image_count = sum(len(items) for items in images_by_message.values())
+            if (
+                settings.rag_enabled
+                and settings.rag_require_match
+                and not knowledge_hits
+                and model_image_count == 0
+            ):
                 assistant_content = RAG_NO_MATCH_RESPONSE
                 decision = SafetyDecision(action="fallback", code="knowledge_not_found")
             else:
                 try:
                     assistant_content = await provider.complete(
                         _chat_turns(
-                            recent,
-                            current_message_id=user_message.id,
-                            images=images,
+                            model_messages,
+                            images_by_message=images_by_message,
                             business_prompt=business_prompt,
                             knowledge_context=knowledge_context,
+                            conversation_memory=conversation_memory,
                         )
                     )
                     if knowledge_hits:
@@ -342,9 +483,10 @@ async def send_message(
             status=assistant_message.status,
             safety_code=assistant_message.safety_code,
             duration_ms=(time.perf_counter() - started) * 1000,
-            transport="request_response",
+            transport=transport,
             prompt_release_id=prompt_release_id,
             prompt_checksum=prompt_checksum,
+            model_image_count=model_image_count,
             error_code=interaction_error,
         )
         return user_message, assistant_message
@@ -375,6 +517,7 @@ async def stream_message(
             settings=settings,
         )
         images = await media_service.load_image_inputs(attachments, settings=settings)
+        model_image_count = len(images)
         await db.commit()
         await db.refresh(user_message)
         yield "user_message", user_message
@@ -399,13 +542,22 @@ async def stream_message(
                         query=normalized_content,
                         settings=settings,
                     )
-                recent = await repository.list_messages(
-                    db,
-                    conversation_id=conversation.id,
-                    limit=settings.history_message_limit,
-                )
                 provider = build_chat_provider(settings)
-                if settings.rag_enabled and settings.rag_require_match and not knowledge_hits and not images:
+                model_messages, images_by_message, conversation_memory = await _model_context(
+                    db,
+                    conversation=conversation,
+                    current_message=user_message,
+                    current_images=images,
+                    provider=provider,
+                    settings=settings,
+                )
+                model_image_count = sum(len(items) for items in images_by_message.values())
+                if (
+                    settings.rag_enabled
+                    and settings.rag_require_match
+                    and not knowledge_hits
+                    and model_image_count == 0
+                ):
                     chunks.append(RAG_NO_MATCH_RESPONSE)
                     yield "delta", RAG_NO_MATCH_RESPONSE
                     decision = SafetyDecision(action="fallback", code="knowledge_not_found")
@@ -413,11 +565,11 @@ async def stream_message(
                     try:
                         async for chunk in provider.stream(
                             _chat_turns(
-                                recent,
-                                current_message_id=user_message.id,
-                                images=images,
+                                model_messages,
+                                images_by_message=images_by_message,
                                 business_prompt=business_prompt,
                                 knowledge_context=knowledge_context,
+                                conversation_memory=conversation_memory,
                             )
                         ):
                             chunks.append(chunk)
@@ -428,7 +580,7 @@ async def stream_message(
                             "model_stream_failed",
                             conversation_id=conversation.id,
                             message_id=user_message.id,
-                            input_type="vision" if images else "text",
+                            input_type="vision" if model_image_count else "text",
                             reason=str(exc),
                             upstream_status=exc.status_code,
                             partial_content_length=sum(len(chunk) for chunk in chunks),
@@ -492,6 +644,7 @@ async def stream_message(
                 transport="sse",
                 prompt_release_id=prompt_release_id,
                 prompt_checksum=prompt_checksum,
+                model_image_count=model_image_count,
                 error_code=interaction_error,
             )
             yield "done", assistant_message
@@ -515,6 +668,7 @@ async def stream_message(
                     transport="sse",
                     prompt_release_id=prompt_release_id,
                     prompt_checksum=prompt_checksum,
+                    model_image_count=model_image_count,
                     error_code=interaction_error or "generation_not_completed",
                 )
                 if partial_content:

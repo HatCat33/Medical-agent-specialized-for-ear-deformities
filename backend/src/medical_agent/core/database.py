@@ -27,6 +27,7 @@ async def get_db() -> AsyncIterator[AsyncSession]:
 async def init_db() -> None:
     # Import models here so SQLAlchemy sees them before creating development tables.
     import_module("medical_agent.modules.conversation.models")
+    import_module("medical_agent.modules.channels.common.models")
     import_module("medical_agent.modules.knowledge.models")
     import_module("medical_agent.modules.media.models")
     import_module("medical_agent.modules.system.models")

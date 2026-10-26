@@ -72,7 +72,30 @@ Internet
 
 `infra/compose/compose.prod.yaml` 当前只是生产配置占位，不能视为已完成的生产部署方案。
 
-## 知识管理端与数据库更新（2026-10-21）
+## Demo 测试版部署（2026-10-26）
+
+本版新增会话摘要、渠道事件去重和微信客服同步游标。更新后端代码后必须执行：
+
+```bash
+cd /root/medical_agent/backend
+uv sync --frozen
+uv run python scripts/upgrade_database.py
+```
+
+患者端和管理端使用生产构建产物，不要对公网直接运行 Vite：
+
+```powershell
+cd F:\medical_agent
+pnpm install --frozen-lockfile
+pnpm --filter @medical-agent/web-h5 build
+pnpm --filter @medical-agent/admin-web build
+```
+
+当前渠道长连接、微信客服同步和内嵌知识任务按单 API 进程设计。Demo 环境只启动一个 Uvicorn worker，并使用进程管理工具确保退出后自动恢复；不要同时在两个终端启动同一后端。
+
+完整演示前检查见 [Demo 演示检查清单](demo-checklist.md)。
+
+## 知识管理端与数据库更新
 
 知识版本、chunk 编辑、后台向量任务及检索评测已接入管理端。使用步骤见 [知识管理手册](knowledge-admin.md)。当前后台任务执行器要求 API 单 worker，任务状态持久化在数据库中。
 

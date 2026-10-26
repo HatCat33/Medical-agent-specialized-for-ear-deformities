@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from medical_agent.modules.conversation.models import Conversation, Message
+from medical_agent.modules.media.models import MediaObject
 
 
 def utc_now() -> datetime:
@@ -19,8 +20,13 @@ async def create_conversation(
     *,
     owner_id: str,
     title: str = "新会话",
+    conversation_id: str | None = None,
 ) -> Conversation:
-    conversation = Conversation(id=str(uuid.uuid4()), owner_id=owner_id, title=title)
+    conversation = Conversation(
+        id=conversation_id or str(uuid.uuid4()),
+        owner_id=owner_id,
+        title=title,
+    )
     db.add(conversation)
     await db.flush()
     return conversation
@@ -67,6 +73,47 @@ async def list_messages(
         statement = statement.limit(limit)
     messages = list(await db.scalars(statement))
     return list(reversed(messages)) if limit else messages
+
+
+async def list_messages_between(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+    after_sequence: int,
+    before_sequence: int,
+) -> list[Message]:
+    """Return unsummarized messages strictly between two sequence numbers."""
+    result = await db.scalars(
+        select(Message)
+        .options(selectinload(Message.attachments))
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.sequence_no > after_sequence,
+            Message.sequence_no < before_sequence,
+        )
+        .order_by(Message.sequence_no.asc())
+    )
+    return list(result)
+
+
+async def list_attached_images(
+    db: AsyncSession,
+    *,
+    conversation_id: str,
+) -> list[tuple[Message, MediaObject]]:
+    """Return current-conversation images newest first, independent of text history limits."""
+    rows = await db.execute(
+        select(Message, MediaObject)
+        .join(MediaObject, MediaObject.message_id == Message.id)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.role == "user",
+            MediaObject.kind == "image",
+            MediaObject.status == "attached",
+        )
+        .order_by(Message.sequence_no.desc(), MediaObject.created_at.desc())
+    )
+    return [(message, media) for message, media in rows.all()]
 
 
 async def add_message(

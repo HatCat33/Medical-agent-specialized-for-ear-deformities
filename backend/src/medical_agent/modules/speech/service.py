@@ -13,6 +13,7 @@ from medical_agent.providers.speech.protocol import AudioInput
 logger = get_logger(__name__)
 
 _AUDIO_FORMATS = {
+    "audio/amr": ".amr",
     "audio/webm": ".webm",
     "audio/ogg": ".ogg",
     "audio/wav": ".wav",
@@ -22,6 +23,8 @@ _AUDIO_FORMATS = {
 
 
 def _detect_audio_media_type(data: bytes) -> str | None:
+    if data.startswith((b"#!AMR\n", b"#!AMR-WB\n")):
+        return "audio/amr"
     if data.startswith(b"\x1aE\xdf\xa3"):
         return "audio/webm"
     if data.startswith(b"OggS"):
@@ -59,6 +62,35 @@ async def transcribe_audio(upload: UploadFile, *, settings: Settings) -> str:
     original_suffix = Path(upload.filename or "").suffix.lower()
     if original_suffix == _AUDIO_FORMATS[media_type]:
         filename = Path(upload.filename or filename).name[:255]
+
+    return await transcribe_audio_bytes(
+        data,
+        filename=filename,
+        media_type=media_type,
+        settings=settings,
+    )
+
+
+async def transcribe_audio_bytes(
+    data: bytes,
+    *,
+    filename: str,
+    media_type: str,
+    settings: Settings,
+) -> str:
+    if not data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="audio_empty")
+    if len(data) > settings.asr_max_audio_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="audio_too_large",
+        )
+    detected_type = _detect_audio_media_type(data)
+    if detected_type != media_type or detected_type not in _AUDIO_FORMATS:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="audio_type_not_supported",
+        )
 
     started_at = time.perf_counter()
     try:

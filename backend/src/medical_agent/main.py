@@ -8,6 +8,8 @@ from medical_agent.core.config import get_settings
 from medical_agent.core.database import close_db, init_db
 from medical_agent.core.logging import configure_logging
 from medical_agent.core.middleware import RequestContextMiddleware
+from medical_agent.modules.channels.wechat_kf.service import runtime as wechat_kf_runtime
+from medical_agent.modules.channels.wecom.service import runtime as wecom_runtime
 
 
 @asynccontextmanager
@@ -27,8 +29,14 @@ async def lifespan(_: FastAPI):
             .values(status="interrupted", active_slot=None, error="server_restarted_retry_required")
         )
         await db.commit()
-    yield
-    await close_db()
+    await wecom_runtime.start(get_settings())
+    await wechat_kf_runtime.start(get_settings())
+    try:
+        yield
+    finally:
+        await wechat_kf_runtime.stop()
+        await wecom_runtime.stop()
+        await close_db()
 
 
 def create_app() -> FastAPI:
@@ -44,7 +52,7 @@ def create_app() -> FastAPI:
         interaction_max_bytes=settings.interaction_log_max_bytes,
         interaction_backup_count=settings.interaction_log_backup_count,
     )
-    app = FastAPI(title="Medical Agent API", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="Medical Agent API", version="0.4.0", lifespan=lifespan)
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(
         CORSMiddleware,

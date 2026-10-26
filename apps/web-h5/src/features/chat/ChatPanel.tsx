@@ -67,9 +67,9 @@ interface ChatPanelProps {
 }
 
 const suggestions = [
-  "小耳畸形通常有哪些类型？",
-  "第一次就诊前需要准备什么？",
-  "日常护理有哪些注意事项？",
+  "在进行耳部功能锻炼时，需要注意什么？",
+  "出院后必须要用纱布盖住耳朵吗？",
+  "单侧小耳畸形是否影响听力，需要定期进行听力检查吗？",
 ];
 
 function SecureMessageImage({ attachment, index }: { attachment: MediaAttachment; index: number }) {
@@ -320,7 +320,7 @@ export function ChatPanel({
             <div className="assistant-avatar" aria-hidden="true">
               <Sparkles size={24} />
             </div>
-            <h1>你好，我是耳畸形科普助手</h1>
+            <h1>您好，我是耳畸形科普助手(Beta)</h1>
             <p>可以询问耳畸形相关的一般知识、就诊准备与护理常识。</p>
             <div className="suggestion-list">
               {suggestions.map((suggestion) => (

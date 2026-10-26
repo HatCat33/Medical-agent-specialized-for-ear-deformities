@@ -81,6 +81,10 @@ def configure_logging(
         handler.setLevel(resolved_level)
         root_logger.addHandler(handler)
 
+    # httpx INFO records include complete request URLs. Channel media URLs contain
+    # short-lived signatures and must not be copied into application logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     interaction_logger = logging.getLogger(INTERACTION_LOGGER_NAME)
     _close_handlers(interaction_logger)
     interaction_logger.setLevel(logging.INFO)

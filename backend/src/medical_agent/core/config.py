@@ -37,7 +37,15 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 60.0
     llm_max_tokens: int = 1024
     llm_enable_thinking: bool | None = None
-    history_message_limit: int = 20
+    history_message_limit: int = Field(default=20, ge=2, le=200)
+    history_summary_batch_size: int = Field(default=8, ge=2, le=100)
+    history_summary_max_chars: int = Field(default=3000, ge=500, le=20_000)
+    history_image_limit: int = Field(default=4, ge=0, le=12)
+    history_image_max_total_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        ge=0,
+        le=64 * 1024 * 1024,
+    )
 
     vision_base_url: str = ""
     vision_api_key: str = ""
@@ -75,9 +83,50 @@ class Settings(BaseSettings):
     embedding_timeout_seconds: float = Field(default=60.0, gt=0.0, le=300.0)
     embedding_batch_size: int = Field(default=32, ge=1, le=256)
 
+    wecom_bot_enabled: bool = False
+    wecom_bot_id: str = ""
+    wecom_bot_secret: str = ""
+    wecom_bot_ws_url: str = "wss://openws.work.weixin.qq.com"
+    wecom_bot_allowed_user_ids: str = ""
+    wecom_bot_allow_groups: bool = False
+    wecom_bot_heartbeat_seconds: float = Field(default=30.0, ge=10.0, le=120.0)
+    wecom_bot_reply_interval_seconds: float = Field(default=0.3, ge=0.1, le=2.0)
+
+    wechat_kf_enabled: bool = False
+    wechat_kf_corp_id: str = ""
+    wechat_kf_secret: str = ""
+    wechat_kf_open_kfid: str = ""
+    wechat_kf_open_kf_ids: str = ""
+    wechat_kf_callback_token: str = ""
+    wechat_kf_callback_aes_key: str = ""
+    wechat_kf_api_base_url: str = "https://qyapi.weixin.qq.com"
+    wechat_kf_allowed_external_user_ids: str = ""
+    wechat_kf_request_timeout_seconds: float = Field(default=20.0, gt=0.0, le=120.0)
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+
+    @property
+    def wecom_bot_allowed_users(self) -> set[str]:
+        return {
+            item.strip()
+            for item in self.wecom_bot_allowed_user_ids.split(",")
+            if item.strip()
+        }
+
+    @property
+    def wechat_kf_open_ids(self) -> set[str]:
+        values = [self.wechat_kf_open_kfid, *self.wechat_kf_open_kf_ids.split(",")]
+        return {item.strip() for item in values if item.strip()}
+
+    @property
+    def wechat_kf_allowed_external_users(self) -> set[str]:
+        return {
+            item.strip()
+            for item in self.wechat_kf_allowed_external_user_ids.split(",")
+            if item.strip()
+        }
 
 
 @lru_cache

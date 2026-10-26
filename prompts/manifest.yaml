@@ -1,3 +1,34 @@
 schema_version: 1
-prompts: []
+prompts:
+  - id: persona-v3-01
+    name: 专业温和型
+    path: persona/01-professional-warm.md
+    recommended: true
+  - id: persona-v3-02
+    name: 简洁直接型
+    path: persona/02-concise-direct.md
+  - id: persona-v3-03
+    name: 结构化科普型
+    path: persona/03-structured-education.md
+  - id: persona-v3-04
+    name: 澄清引导型
+    path: persona/04-clarify-first.md
+  - id: persona-v3-05
+    name: 家长沟通型
+    path: persona/05-parent-friendly.md
+  - id: persona-v3-06
+    name: 就诊准备型
+    path: persona/06-visit-preparation.md
+  - id: persona-v3-07
+    name: 图文咨询型
+    path: persona/07-image-consultation.md
+  - id: persona-v3-08
+    name: 自然口语型
+    path: persona/08-natural-conversation.md
+  - id: persona-v3-09
+    name: 知识库严谨型
+    path: persona/09-rag-grounded.md
+  - id: persona-v3-10
+    name: 综合增强型
+    path: persona/10-balanced-advanced.md
 

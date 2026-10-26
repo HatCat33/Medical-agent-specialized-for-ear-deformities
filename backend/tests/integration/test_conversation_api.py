@@ -14,8 +14,9 @@ from medical_agent.api import dependencies as api_dependencies
 from medical_agent.api.router import api_router
 from medical_agent.core.config import Settings
 from medical_agent.core.database import Base, get_db
+from medical_agent.modules.conversation import repository as conversation_repository
 from medical_agent.modules.conversation import service as conversation_service
-from medical_agent.modules.conversation.models import Message
+from medical_agent.modules.conversation.models import Conversation, Message
 from medical_agent.modules.knowledge import router as knowledge_router_module
 from medical_agent.modules.knowledge import service as knowledge_service
 from medical_agent.modules.knowledge.models import KnowledgeEntry, KnowledgeRelease
@@ -23,7 +24,7 @@ from medical_agent.modules.media import router as media_router_module
 from medical_agent.modules.speech import router as speech_router_module
 from medical_agent.modules.speech import service as speech_service
 from medical_agent.modules.system.models import PromptRelease
-from medical_agent.providers.llm.client import DemoChatProvider
+from medical_agent.providers.llm.client import DemoChatProvider, ProviderError
 from medical_agent.providers.llm.protocol import ChatTurn
 from medical_agent.providers.speech.protocol import AudioInput
 
@@ -103,7 +104,7 @@ async def test_conversation_lifecycle_and_owner_isolation(
     assert payload["user_message"]["sequence_no"] == 1
     assert payload["assistant_message"]["sequence_no"] == 2
     assert payload["assistant_message"]["safety_code"] == "allowed"
-    assert "第三版演示模式" in payload["assistant_message"]["content"]
+    assert "Demo 测试模式" in payload["assistant_message"]["content"]
     assert payload["conversation"]["title"] == "第一次就诊前需要准备什么？"
 
     history = await client.get(f"/api/v1/conversations/{conversation_id}", headers=owner_headers)
@@ -246,6 +247,255 @@ async def test_image_attachments_are_private_persisted_and_deleted_with_history(
 
 
 @pytest.mark.asyncio
+async def test_followup_reuses_images_only_inside_the_same_conversation(
+    api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = api_client
+    calls: list[list[ChatTurn]] = []
+
+    class ImageContextProvider:
+        async def complete(self, messages: list[ChatTurn]) -> str:
+            calls.append(messages)
+            return "已结合当前会话中的图片上下文回答。"
+
+        async def stream(self, messages: list[ChatTurn]) -> AsyncIterator[str]:
+            yield await self.complete(messages)
+
+    def build_image_context_provider(_: Settings) -> ImageContextProvider:
+        return ImageContextProvider()
+
+    monkeypatch.setattr(
+        conversation_service,
+        "build_chat_provider",
+        build_image_context_provider,
+    )
+    headers = {"X-Visitor-ID": "visitor-image-context-013"}
+    png = b"\x89PNG\r\n\x1a\n" + b"same-conversation-image"
+    uploaded = await client.post(
+        "/api/v1/media/images",
+        files=[("images", ("first.png", png, "image/png"))],
+        headers=headers,
+    )
+    media_id = uploaded.json()[0]["id"]
+    created = await client.post("/api/v1/conversations", json={}, headers=headers)
+    conversation_id = created.json()["id"]
+
+    first = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages",
+        json={
+            "content": "这是我刚才提到的第一张照片。",
+            "attachment_ids": [media_id],
+            "input_mode": "multimodal",
+        },
+        headers=headers,
+    )
+    assert first.status_code == 200
+    followup = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages",
+        json={"content": "这张图还有哪些可客观说明的信息？"},
+        headers=headers,
+    )
+    assert followup.status_code == 200
+
+    assert len(calls) == 2
+    historical_turn = next(
+        turn for turn in calls[1] if "第一张照片" in turn.content
+    )
+    assert len(historical_turn.images) == 1
+    assert historical_turn.images[0].data == png
+    assert "会话图片上下文" in historical_turn.content
+    assert not next(turn for turn in reversed(calls[1]) if turn.role == "user").images
+
+    other = await client.post("/api/v1/conversations", json={}, headers=headers)
+    isolated_followup = await client.post(
+        f"/api/v1/conversations/{other.json()['id']}/messages",
+        json={"content": "刚才那张图还有什么信息？"},
+        headers=headers,
+    )
+    assert isolated_followup.status_code == 200
+    assert not any(turn.images for turn in calls[2])
+
+
+@pytest.mark.asyncio
+async def test_long_conversation_rolls_old_messages_into_summary_and_keeps_old_image(
+    api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_maker = api_client
+    answer_calls: list[list[ChatTurn]] = []
+    summary_calls: list[list[ChatTurn]] = []
+
+    class MemoryProvider:
+        async def complete(self, messages: list[ChatTurn]) -> str:
+            if messages[0].content.startswith("你负责压缩"):
+                summary_calls.append(messages)
+                return "患者已更正：患儿目前4岁；仍关注首次就诊准备。"
+            answer_calls.append(messages)
+            return "已结合本次会话记忆和历史图片回答。"
+
+        async def stream(self, messages: list[ChatTurn]) -> AsyncIterator[str]:
+            yield await self.complete(messages)
+
+    provider = MemoryProvider()
+
+    def build_memory_provider(_: Settings) -> MemoryProvider:
+        return provider
+
+    monkeypatch.setattr(conversation_service, "build_chat_provider", build_memory_provider)
+    settings = conversation_service.get_settings().model_copy(
+        update={
+            "history_message_limit": 20,
+            "history_summary_batch_size": 8,
+            "history_summary_max_chars": 3000,
+        }
+    )
+    monkeypatch.setattr(conversation_service, "get_settings", lambda: settings)
+
+    headers = {"X-Visitor-ID": "visitor-long-memory-014"}
+    png = b"\x89PNG\r\n\x1a\n" + b"old-conversation-image"
+    uploaded = await client.post(
+        "/api/v1/media/images",
+        files=[("images", ("old.png", png, "image/png"))],
+        headers=headers,
+    )
+    created = await client.post("/api/v1/conversations", json={}, headers=headers)
+    conversation_id = created.json()["id"]
+    first = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages",
+        json={
+            "content": "这是患儿3岁时拍的耳部照片。",
+            "attachment_ids": [uploaded.json()[0]["id"]],
+            "input_mode": "multimodal",
+        },
+        headers=headers,
+    )
+    assert first.status_code == 200
+
+    async with session_maker() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        for index in range(13):
+            user_content = (
+                "更正前面的年龄信息，患儿目前4岁。"
+                if index == 3
+                else f"第{index + 2}轮患者补充"
+            )
+            await conversation_repository.add_message(
+                session,
+                conversation=conversation,
+                role="user",
+                content=user_content,
+            )
+            await conversation_repository.add_message(
+                session,
+                conversation=conversation,
+                role="assistant",
+                content=f"第{index + 2}轮助手回复",
+            )
+        await session.commit()
+
+    followup = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages",
+        json={"content": "结合之前那张照片和我更正的信息，还要准备什么？"},
+        headers=headers,
+    )
+    assert followup.status_code == 200
+    assert len(summary_calls) == 1
+    assert "患儿目前4岁" in summary_calls[0][1].content
+    assert not any(turn.images for turn in summary_calls[0])
+
+    final_call = answer_calls[-1]
+    assert "<当前会话压缩记忆>" in final_call[0].content
+    assert "患儿目前4岁" in final_call[0].content
+    old_image_turn = next(turn for turn in final_call if "3岁时拍的耳部照片" in turn.content)
+    assert len(old_image_turn.images) == 1
+    assert old_image_turn.images[0].data == png
+
+    async with session_maker() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        assert conversation.memory_summary.startswith("患者已更正")
+        assert conversation.memory_through_sequence == 9
+        assert conversation.memory_updated_at is not None
+
+    isolated = await client.post("/api/v1/conversations", json={}, headers=headers)
+    isolated_response = await client.post(
+        f"/api/v1/conversations/{isolated.json()['id']}/messages",
+        json={"content": "之前更正的信息是什么？"},
+        headers=headers,
+    )
+    assert isolated_response.status_code == 200
+    isolated_call = answer_calls[-1]
+    assert "<当前会话压缩记忆>" not in isolated_call[0].content
+    assert not any(turn.images for turn in isolated_call)
+
+
+@pytest.mark.asyncio
+async def test_summary_failure_keeps_unsummarized_messages_in_model_context(
+    api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_maker = api_client
+    answer_calls: list[list[ChatTurn]] = []
+
+    class FailingSummaryProvider:
+        async def complete(self, messages: list[ChatTurn]) -> str:
+            if messages[0].content.startswith("你负责压缩"):
+                raise ProviderError("summary_provider_unavailable")
+            answer_calls.append(messages)
+            return "摘要失败后仍正常回答。"
+
+        async def stream(self, messages: list[ChatTurn]) -> AsyncIterator[str]:
+            yield await self.complete(messages)
+
+    def build_failing_summary_provider(_: Settings) -> FailingSummaryProvider:
+        return FailingSummaryProvider()
+
+    monkeypatch.setattr(
+        conversation_service,
+        "build_chat_provider",
+        build_failing_summary_provider,
+    )
+    settings = conversation_service.get_settings().model_copy(
+        update={"history_message_limit": 4, "history_summary_batch_size": 2}
+    )
+    monkeypatch.setattr(conversation_service, "get_settings", lambda: settings)
+
+    headers = {"X-Visitor-ID": "visitor-summary-failure-015"}
+    created = await client.post("/api/v1/conversations", json={}, headers=headers)
+    conversation_id = created.json()["id"]
+    async with session_maker() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        for sequence in range(1, 7):
+            await conversation_repository.add_message(
+                session,
+                conversation=conversation,
+                role="user" if sequence % 2 else "assistant",
+                content=f"必须保留的旧消息{sequence}",
+            )
+        await session.commit()
+
+    response = await client.post(
+        f"/api/v1/conversations/{conversation_id}/messages",
+        json={"content": "继续咨询"},
+        headers=headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == "摘要失败后仍正常回答。"
+    model_text = "\n".join(turn.content for turn in answer_calls[-1])
+    assert "必须保留的旧消息1" in model_text
+    assert "必须保留的旧消息6" in model_text
+
+    async with session_maker() as session:
+        conversation = await session.get(Conversation, conversation_id)
+        assert conversation is not None
+        assert conversation.memory_summary == ""
+        assert conversation.memory_through_sequence == 0
+
+
+@pytest.mark.asyncio
 async def test_media_rejects_unsupported_content(
     api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
 ) -> None:
@@ -341,7 +591,7 @@ async def test_sync_and_stream_interactions_emit_debug_records(
         "普通请求日志测试",
         "流式请求日志测试",
     ]
-    assert all("第三版演示模式" in str(record["output_text"]) for _, record in records)
+    assert all("Demo 测试模式" in str(record["output_text"]) for _, record in records)
     assert all(record["status"] == "completed" for _, record in records)
     assert all(record["provider"] == "demo" for _, record in records)
     assert all(record["owner_ref"] != headers["X-Visitor-ID"] for _, record in records)

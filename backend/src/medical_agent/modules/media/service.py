@@ -62,7 +62,7 @@ async def store_images(
             detail="image_count_invalid",
         )
 
-    prepared: list[tuple[UploadFile, bytes, str]] = []
+    prepared: list[tuple[str | None, bytes, str]] = []
     total_bytes = 0
     for upload in uploads:
         try:
@@ -88,12 +88,69 @@ async def store_images(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail="images_total_too_large",
             )
-        prepared.append((upload, data, detected_type))
+        prepared.append((upload.filename, data, detected_type))
+
+    return await _store_prepared_images(
+        db,
+        prepared=prepared,
+        owner_id=owner_id,
+        settings=settings,
+    )
+
+
+async def store_image_bytes(
+    db: AsyncSession,
+    *,
+    images: list[tuple[str, bytes]],
+    owner_id: str,
+    settings: Settings,
+) -> list[MediaObject]:
+    if not images or len(images) > settings.media_max_image_count:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="image_count_invalid")
+    prepared: list[tuple[str | None, bytes, str]] = []
+    total_bytes = 0
+    for filename, data in images:
+        if not data:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="image_empty")
+        if len(data) > settings.media_max_image_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="image_too_large",
+            )
+        media_type = _detect_image_media_type(data)
+        if media_type is None:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="image_type_not_supported",
+            )
+        total_bytes += len(data)
+        if total_bytes > settings.media_max_total_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="images_total_too_large",
+            )
+        prepared.append((filename, data, media_type))
+    return await _store_prepared_images(
+        db,
+        prepared=prepared,
+        owner_id=owner_id,
+        settings=settings,
+    )
+
+
+async def _store_prepared_images(
+    db: AsyncSession,
+    *,
+    prepared: list[tuple[str | None, bytes, str]],
+    owner_id: str,
+    settings: Settings,
+) -> list[MediaObject]:
+    total_bytes = sum(len(data) for _, data, _ in prepared)
 
     stored_paths: list[Path] = []
     media_objects: list[MediaObject] = []
     try:
-        for upload, data, media_type in prepared:
+        for filename, data, media_type in prepared:
             media_id = str(uuid.uuid4())
             extension = _IMAGE_EXTENSIONS[media_type]
             storage_key = f"images/{media_id[:2]}/{media_id}{extension}"
@@ -101,7 +158,7 @@ async def store_images(
                 id=media_id,
                 owner_id=owner_id,
                 kind="image",
-                original_name=_safe_original_name(upload.filename, media_type),
+                original_name=_safe_original_name(filename, media_type),
                 media_type=media_type,
                 size_bytes=len(data),
                 storage_key=storage_key,

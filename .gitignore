@@ -61,3 +61,8 @@ packages/api-client/src/generated/
 Thumbs.db
 Desktop.ini
 
+# Domain-verification files are served only from the patient H5 public directory.
+/WW_verify_*.txt
+/apps/admin-web/WW_verify_*.txt
+/apps/web-h5/WW_verify_*.txt
+
