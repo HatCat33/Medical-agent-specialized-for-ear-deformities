@@ -93,7 +93,8 @@ export const systemApi = <T>(token: string, path: string, init?: RequestInit) =>
 export interface Overview {
   rag_enabled: boolean; database: string; embedding_configured: boolean;
   embedding_model: string; rag_top_k: number; rag_min_score: number;
-  rag_relative_score: number; chunk_strategy: string; vector_storage: string; active_jobs: number;
+  rag_relative_score: number; chunk_strategy: string; vector_storage: string;
+  interaction_count?: number; active_jobs: number;
 }
 export interface Release {
   id: string; name: string; source_name: string; status: string;

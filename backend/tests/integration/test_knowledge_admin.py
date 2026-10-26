@@ -15,6 +15,7 @@ from medical_agent.api import dependencies
 from medical_agent.api.router import api_router
 from medical_agent.core.config import Settings
 from medical_agent.core.database import Base, get_db
+from medical_agent.modules.conversation.models import Conversation, Message
 from medical_agent.modules.knowledge import admin_router, retriever, service
 from medical_agent.modules.knowledge.models import (
     KnowledgeEntry,
@@ -112,6 +113,46 @@ async def test_auth_empty_database_and_validation(
             f"{PREFIX}/releases/{release_id}/entries", json={**ENTRY, "question": "   "}
         )
     ).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_overview_counts_each_user_message_as_one_interaction(
+    admin: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    client, factory = admin
+    async with factory() as db:
+        conversation = Conversation(id="conversation-1", owner_id="visitor-1", title="测试会话")
+        db.add(conversation)
+        db.add_all(
+            [
+                Message(
+                    id="message-user-1",
+                    conversation_id=conversation.id,
+                    sequence_no=1,
+                    role="user",
+                    content="第一次提问",
+                ),
+                Message(
+                    id="message-assistant-1",
+                    conversation_id=conversation.id,
+                    sequence_no=2,
+                    role="assistant",
+                    content="第一次回复",
+                ),
+                Message(
+                    id="message-user-2",
+                    conversation_id=conversation.id,
+                    sequence_no=3,
+                    role="user",
+                    content="第二次提问",
+                ),
+            ]
+        )
+        await db.commit()
+
+    overview = await client.get(PREFIX + "/overview")
+    assert overview.status_code == 200
+    assert overview.json()["interaction_count"] == 2
 
 
 @pytest.mark.asyncio

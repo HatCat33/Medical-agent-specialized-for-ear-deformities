@@ -44,6 +44,7 @@ export function KnowledgeDashboard({ token, section }: { token: string; section:
       <div className="metric-strip">
         <div className="metric-item"><span>患者端 RAG</span><strong>{overview.data.rag_enabled ? "已开启" : "未开启"}</strong></div>
         <div className="metric-item"><span>当前发布条目</span><strong>{releases.data?.find(r => r.status === "published")?.entry_count ?? 0}</strong></div>
+        <div className="metric-item" title="按数据库中已保留的用户提问统计，模型回复不会重复计数"><span>交互次数</span><strong>{(overview.data.interaction_count ?? 0).toLocaleString("zh-CN")}</strong></div>
         <div className="metric-item"><span>后台任务</span><strong>{overview.data.active_jobs}</strong></div>
       </div>
       <Suspense fallback={<Spin />}><ModelsPanel key={revision} token={token} /></Suspense>

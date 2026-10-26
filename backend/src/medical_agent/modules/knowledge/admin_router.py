@@ -17,6 +17,7 @@ from starlette.concurrency import run_in_threadpool
 from medical_agent.api.dependencies import require_admin_token
 from medical_agent.core.config import get_settings
 from medical_agent.core.database import get_db, session_factory
+from medical_agent.modules.conversation.models import Message
 from medical_agent.modules.ingestion.faq_xlsx import parse_faq_xlsx
 from medical_agent.modules.knowledge import admin_service as service
 from medical_agent.modules.knowledge.admin_schemas import (
@@ -54,6 +55,11 @@ async def overview(db: Db) -> dict[str, Any]:
         "rag_relative_score": settings.rag_relative_score,
         "chunk_strategy": "一条 FAQ（问题 + 其他问法 + 答案）为一个 chunk",
         "vector_storage": "数据库 JSON 向量，应用层混合检索",
+        # One accepted user message is one interaction; the assistant reply is not counted again.
+        "interaction_count": await db.scalar(
+            select(func.count()).select_from(Message).where(Message.role == "user")
+        )
+        or 0,
         "active_jobs": await db.scalar(
             select(func.count())
             .select_from(KnowledgeOperation)

@@ -50,6 +50,7 @@ backups/
 
 # Generated artifacts
 .artifacts/
+/admin-web-dist.tar.gz
 evals/reports/*
 !evals/reports/.gitkeep
 packages/api-client/src/generated/
