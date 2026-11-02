@@ -72,11 +72,13 @@ try {
     await page.getByText("模型配置不完整", { exact: true }).waitFor();
     await page.getByText(/补全 EMBEDDING_BASE_URL/).waitFor();
     await page.screenshot({ path: path.join(output, `${device}-admin-models.png`), fullPage: true });
-    await page.getByRole("button", { name: "声音设置", exact: true }).click();
+    await page.getByRole("button", { name: "运行总览", exact: true }).click();
+    await page.getByLabel("配置云端语音合成").click();
+    await page.getByRole("tab", { name: "音色与播报" }).click();
     const saveColor = await page.getByRole("button", { name: "保存设置", exact: true }).locator("span").last().evaluate(element => getComputedStyle(element).color);
     if (saveColor !== "rgb(255, 255, 255)") throw new Error(`Save button text lacks contrast: ${saveColor}`);
     await page.getByLabel("音色名称", { exact: true }).fill("e2e-device-voice");
-    await page.locator("button").filter({ hasText: "保存设置" }).click();
+    await page.getByRole("button", { name: "保存播报设置" }).click();
     await page.getByText("声音设置已保存，患者端刷新后生效。").waitFor();
     const speech = await fetch(`${apiUrl}/speech/settings`).then(response => response.json());
     if (speech.voice !== "e2e-device-voice") throw new Error("Speech defaults did not persist.");
@@ -85,6 +87,7 @@ try {
     await page.getByText("云端语音 · 自定义音色", { exact: true }).last().click();
     await page.getByLabel("云端音色 ID", { exact: true }).fill("cloned:test-voice");
     await page.screenshot({ path: path.join(output, `${device}-admin-cloud-voice.png`), fullPage: true });
+    await page.getByRole("button", { name: "Close" }).click();
     await page.getByRole("button", { name: "知识版本", exact: true }).click();
     const releaseName = `验收 ${device} ${Date.now()}`;
     await page.getByLabel("新版本名称").fill(releaseName);

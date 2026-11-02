@@ -20,7 +20,9 @@ from medical_agent.core.database import get_db, session_factory
 from medical_agent.modules.conversation.models import Message
 from medical_agent.modules.ingestion.faq_xlsx import parse_faq_xlsx
 from medical_agent.modules.knowledge import admin_service as service
+from medical_agent.modules.knowledge import conversation_test_service
 from medical_agent.modules.knowledge.admin_schemas import (
+    ConversationTestRequest,
     DraftRequest,
     EntryEdit,
     EvaluationCaseGenerateRequest,
@@ -53,6 +55,20 @@ async def overview(db: Db) -> dict[str, Any]:
         "rag_top_k": settings.rag_top_k,
         "rag_min_score": settings.rag_min_score,
         "rag_relative_score": settings.rag_relative_score,
+        "reranker_enabled": settings.reranker_enabled,
+        "reranker_configured": bool(
+            settings.reranker_base_url
+            and settings.reranker_api_key
+            and settings.reranker_model
+        ),
+        "reranker_model": settings.reranker_model,
+        "knowledge_draft_limit": settings.knowledge_draft_limit,
+        "knowledge_draft_count": await db.scalar(
+            select(func.count())
+            .select_from(KnowledgeRelease)
+            .where(KnowledgeRelease.status == "draft")
+        )
+        or 0,
         "chunk_strategy": "一条 FAQ（问题 + 其他问法 + 答案）为一个 chunk",
         "vector_storage": "数据库 JSON 向量，应用层混合检索",
         # One accepted user message is one interaction; the assistant reply is not counted again.
@@ -78,7 +94,13 @@ async def releases(db: Db) -> list[dict[str, Any]]:
 @router.post("/releases", status_code=201)
 async def create_release(payload: DraftRequest, db: Db) -> dict[str, Any]:
     return await service.release_view(
-        db, await service.create_draft(db, payload.name, payload.base_release_id)
+        db,
+        await service.create_draft(
+            db,
+            payload.name,
+            payload.base_release_id,
+            draft_limit=get_settings().knowledge_draft_limit,
+        ),
     )
 
 
@@ -293,3 +315,8 @@ async def generate_evaluation_cases(
 @router.post("/evaluations")
 async def evaluate(payload: EvaluationRequest, db: Db) -> dict[str, Any]:
     return service.operation_view(await service.evaluate(db, payload, get_settings()))
+
+
+@router.post("/conversation-tests")
+async def conversation_test(payload: ConversationTestRequest, db: Db) -> dict[str, Any]:
+    return await conversation_test_service.run(db, payload)

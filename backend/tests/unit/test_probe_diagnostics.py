@@ -59,3 +59,18 @@ def test_connection_timeout_and_missing_configuration_are_distinguished() -> Non
         safe_host("https://user:password@vendor.test:443/v1?token=secret")
         == "https://vendor.test:443"
     )
+
+
+def test_disabled_reranker_reports_enable_switch_instead_of_fake_provider_field() -> None:
+    settings = Settings(
+        reranker_base_url="https://rerank.example/v1",
+        reranker_api_key="secret",
+        reranker_model="rerank-model",
+        reranker_enabled=False,
+    )
+
+    detail = failure_detail(RuntimeError("model_not_configured"), "reranker", settings)
+
+    assert detail["summary"] == "Rerank 精排尚未启用"
+    assert detail["missing_fields"] == ["RERANKER_ENABLED=true"]
+    assert "RERANKER_PROVIDER" not in str(detail)

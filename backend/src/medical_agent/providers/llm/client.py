@@ -8,7 +8,10 @@ from collections.abc import AsyncIterator
 import httpx
 
 from medical_agent.core.config import Settings
+from medical_agent.core.logging import get_logger
 from medical_agent.providers.llm.protocol import ChatProvider, ChatTurn
+
+logger = get_logger(__name__)
 
 
 class ProviderError(RuntimeError):
@@ -147,7 +150,91 @@ class OpenAICompatibleProvider:
         return {"role": turn.role, "content": content}
 
 
+class ResilientChatProvider:
+    """Retry before the first token, then fail over without duplicating partial output."""
+
+    def __init__(
+        self,
+        primary: ChatProvider,
+        *,
+        retry_count: int,
+        fallback: ChatProvider | None = None,
+    ) -> None:
+        self.primary = primary
+        self.retry_count = retry_count
+        self.fallback = fallback
+
+    async def complete(self, messages: list[ChatTurn]) -> str:
+        content = "".join([chunk async for chunk in self.stream(messages)]).strip()
+        if not content:
+            raise ProviderError("model_response_empty")
+        return content
+
+    async def stream(self, messages: list[ChatTurn]) -> AsyncIterator[str]:
+        providers = [
+            *(self.primary for _ in range(self.retry_count + 1)),
+            *([self.fallback] if self.fallback is not None else []),
+        ]
+        last_error: ProviderError | None = None
+        for attempt, provider in enumerate(providers, start=1):
+            emitted = False
+            try:
+                async for chunk in provider.stream(messages):
+                    emitted = True
+                    yield chunk
+                if not emitted:
+                    raise ProviderError("model_response_empty")
+                return
+            except ProviderError as exc:
+                last_error = exc
+                if emitted:
+                    raise
+                next_is_fallback = self.fallback is not None and attempt == self.retry_count + 1
+                logger.warning(
+                    "model_provider_attempt_failed",
+                    attempt=attempt,
+                    primary_retry=attempt <= self.retry_count,
+                    switching_to_fallback=next_is_fallback,
+                    reason=str(exc),
+                    upstream_status=exc.status_code,
+                )
+                if attempt <= self.retry_count:
+                    await asyncio.sleep(0.15 * attempt)
+        raise last_error or ProviderError("model_request_failed")
+
+
+def _fallback_provider(settings: Settings) -> OpenAICompatibleProvider | None:
+    if not (
+        settings.fallback_llm_base_url
+        and settings.fallback_llm_api_key
+        and settings.fallback_llm_model
+    ):
+        return None
+    fallback_settings = settings.model_copy(
+        update={
+            "llm_provider": "openai-compatible",
+            "llm_base_url": settings.fallback_llm_base_url,
+            "llm_api_key": settings.fallback_llm_api_key,
+            "llm_model": settings.fallback_llm_model,
+            "llm_timeout_seconds": settings.fallback_llm_timeout_seconds,
+            "llm_max_tokens": settings.fallback_llm_max_tokens,
+            "llm_enable_thinking": settings.fallback_llm_enable_thinking,
+            # A multimodal fallback can serve image turns through the same endpoint.
+            "vision_base_url": settings.fallback_llm_base_url,
+            "vision_api_key": settings.fallback_llm_api_key,
+            "vision_model": settings.fallback_llm_model,
+            "vision_max_tokens": settings.fallback_llm_max_tokens,
+            "vision_enable_thinking": settings.fallback_llm_enable_thinking,
+        }
+    )
+    return OpenAICompatibleProvider(fallback_settings)
+
+
 def build_chat_provider(settings: Settings) -> ChatProvider:
     if settings.llm_provider == "demo":
         return DemoChatProvider()
-    return OpenAICompatibleProvider(settings)
+    return ResilientChatProvider(
+        OpenAICompatibleProvider(settings),
+        retry_count=settings.llm_retry_count,
+        fallback=_fallback_provider(settings),
+    )

@@ -16,8 +16,11 @@
     "test:e2e:voice": "node tests/e2e/voice-input-smoke.mjs",
     "test:e2e:playback": "node tests/e2e/speech-playback-smoke.mjs",
     "test:e2e:continuous-speech": "node tests/e2e/continuous-speech-smoke.mjs",
+    "test:e2e:pcm-stream-speech": "node tests/e2e/pcm-stream-speech-smoke.mjs",
+    "test:e2e:patient-ui": "node tests/e2e/patient-ui-mock-smoke.mjs",
     "test:e2e:markdown": "node tests/e2e/markdown-spacing-smoke.mjs",
-    "test:e2e:admin": "node tests/e2e/admin-smoke.mjs"
+    "test:e2e:admin": "node tests/e2e/admin-smoke.mjs",
+    "test:e2e:admin-ui": "node tests/e2e/admin-ui-mock-smoke.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.0",

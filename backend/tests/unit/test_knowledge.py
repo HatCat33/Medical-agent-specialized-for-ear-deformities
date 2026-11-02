@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from medical_agent.core.config import Settings
 from medical_agent.core.database import Base
+from medical_agent.modules.knowledge import retriever
 from medical_agent.modules.knowledge import service as knowledge_service
 from medical_agent.modules.knowledge.models import KnowledgeEntry, KnowledgeRelease
 from medical_agent.modules.knowledge.retriever import retrieve
@@ -17,6 +18,7 @@ from medical_agent.modules.knowledge.service import (
     deduplicate_faq_entries,
     rebuild_release_embeddings,
 )
+from medical_agent.providers.rerank.client import RerankResult
 
 
 def faq_entry(*, row: int, answer: str = "请携带既往检查资料。") -> FaqEntryInput:
@@ -86,6 +88,76 @@ async def test_keyword_retrieval_uses_published_release(tmp_path: Path) -> None:
     assert len(hits) == 1
     assert hits[0].question == "第一次就诊需要准备什么？"
     assert "[1] 测试发布" in citation_markdown(hits)
+
+
+@pytest.mark.asyncio
+async def test_reranker_reorders_candidates_and_exposes_score(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'reranker.db'}")
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    release_id = str(uuid.uuid4())
+    async with session_maker() as db:
+        release = KnowledgeRelease(
+            id=release_id,
+            name="精排测试",
+            source_name="FAQ.xlsx",
+            source_checksum="r" * 64,
+            status="published",
+            entry_count=2,
+            published_at=datetime.now(UTC),
+        )
+        db.add(release)
+        for row, question in enumerate(("耳朵怎么护理", "术后耳廓如何护理"), start=2):
+            db.add(
+                KnowledgeEntry(
+                    id=str(uuid.uuid4()),
+                    release_id=release_id,
+                    category="护理",
+                    question=question,
+                    aliases="耳部护理",
+                    answer=f"护理答案 {row}",
+                    effective_date="",
+                    source_sheet="FAQ",
+                    source_row=row,
+                    search_text=f"{question} 耳部护理",
+                )
+            )
+        await db.commit()
+
+        class FakeReranker:
+            async def rerank(self, *, query: str, documents: list[str], top_n: int):
+                assert query == "耳廓护理"
+                preferred = next(index for index, text in enumerate(documents) if "术后耳廓" in text)
+                other = 1 - preferred
+                return [
+                    RerankResult(index=preferred, score=0.99),
+                    RerankResult(index=other, score=0.4),
+                ]
+
+        monkeypatch.setattr(retriever, "build_reranker_provider", lambda _: FakeReranker())
+        result = await retriever.retrieve_detailed(
+            db,
+            query="耳廓护理",
+            settings=Settings(
+                rag_enabled=True,
+                rag_min_score=0,
+                rag_relative_score=0,
+                reranker_enabled=True,
+                reranker_base_url="https://rerank.example/v1",
+                reranker_api_key="secret",
+                reranker_model="rerank-model",
+            ),
+        )
+
+    await engine.dispose()
+    assert result.mode == "lexical_reranked"
+    assert result.hits[0].question == "术后耳廓如何护理"
+    assert result.scores[result.hits[0].entry_id]["rerank"] == 0.99
 
 
 @pytest.mark.asyncio

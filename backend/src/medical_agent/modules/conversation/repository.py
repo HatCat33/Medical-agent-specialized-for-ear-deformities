@@ -32,6 +32,33 @@ async def create_conversation(
     return conversation
 
 
+async def get_or_create_empty_conversation(
+    db: AsyncSession,
+    *,
+    owner_id: str,
+    title: str = "新会话",
+) -> Conversation:
+    """Reuse the newest untouched conversation and remove older empty duplicates."""
+    result = await db.scalars(
+        select(Conversation)
+        .where(
+            Conversation.owner_id == owner_id,
+            Conversation.status != "deleted",
+            Conversation.title == title,
+            Conversation.last_message_at.is_(None),
+        )
+        .order_by(Conversation.created_at.desc())
+    )
+    empty = list(result)
+    if not empty:
+        return await create_conversation(db, owner_id=owner_id, title=title)
+    current = empty[0]
+    redundant_ids = [item.id for item in empty[1:]]
+    if redundant_ids:
+        await db.execute(delete(Conversation).where(Conversation.id.in_(redundant_ids)))
+    return current
+
+
 async def list_conversations(db: AsyncSession, *, owner_id: str) -> list[Conversation]:
     result = await db.scalars(
         select(Conversation)

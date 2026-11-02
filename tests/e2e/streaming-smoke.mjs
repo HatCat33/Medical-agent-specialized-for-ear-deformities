@@ -21,17 +21,18 @@ try {
   });
   const page = await context.newPage();
   await page.goto(baseUrl, { waitUntil: "networkidle" });
-  await page.getByRole("button", { name: "第一次就诊前需要准备什么？" }).click();
+  await page.locator(".suggestion-list button").first().click();
 
   const stopButton = page.getByRole("button", { name: "停止生成" });
   await stopButton.waitFor();
   const streamingAnswer = page.locator(".message-row.assistant .is-streaming");
+  await page.waitForFunction(() => Boolean(document.querySelector(".message-row.assistant .is-streaming")?.textContent?.trim()));
   const streamingElement = await streamingAnswer.elementHandle({ timeout: 10000 });
   const partialText = await streamingElement?.textContent();
   if (!partialText?.trim()) throw new Error("No partial answer was rendered before completion.");
 
   await stopButton.click();
-  await page.getByText("回答未完整生成").waitFor();
+  await page.getByText("回答已中断").waitFor();
   await page.getByRole("button", { name: "发送问题" }).waitFor();
 
   const persistedStatus = await page.evaluate(async (apiBase) => {

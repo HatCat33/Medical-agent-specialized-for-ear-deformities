@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from medical_agent.api import dependencies
 from medical_agent.api.router import api_router
-from medical_agent.core.config import Settings
+from medical_agent.core.config import Settings, apply_runtime_model_overrides, get_settings
 from medical_agent.core.database import Base, get_db
 from medical_agent.modules.speech import router as speech_router
 from medical_agent.modules.system import router as system_router
@@ -54,6 +54,7 @@ async def system_admin(
         headers={"X-Admin-Token": "test-admin"},
     ) as client:
         yield client
+    apply_runtime_model_overrides({})
     await engine.dispose()
 
 
@@ -61,6 +62,20 @@ async def create_prompt(client: AsyncClient, name: str, content: str) -> dict[st
     response = await client.post(f"{PREFIX}/prompts", json={"name": name, "content": content})
     assert response.status_code == 201, response.text
     return response.json()
+
+
+@pytest.mark.asyncio
+async def test_prompt_drafts_are_bounded(system_admin: AsyncClient) -> None:
+    for index in range(5):
+        await create_prompt(system_admin, f"提示词草稿 {index + 1}", "测试内容")
+
+    rejected = await system_admin.post(
+        f"{PREFIX}/prompts",
+        json={"name": "第六个草稿", "content": "测试内容"},
+    )
+
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"] == "prompt_draft_limit_reached"
 
 
 @pytest.mark.asyncio
@@ -111,6 +126,8 @@ async def test_model_inventory_masks_secrets_and_manual_probe_is_audited(
     assert cards["chat"]["endpoint_host"] == "本地进程"
     assert cards["chat"]["api_key_configured"] is False
     assert cards["vision"]["endpoint_host"] == "https://vision.example"
+    assert "chat_fallback" in cards
+    assert "reranker" in cards
     assert cards["tts"]["client_only"] is False
     assert cards["browser_tts"]["client_only"] is True
 
@@ -120,6 +137,106 @@ async def test_model_inventory_masks_secrets_and_manual_probe_is_audited(
     after = (await system_admin.get(f"{PREFIX}/models")).json()
     chat = next(item for item in after["items"] if item["kind"] == "chat")
     assert chat["last_probe"]["id"] == probe.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_model_configuration_is_write_only_persisted_and_applied(
+    system_admin: AsyncClient,
+) -> None:
+    payload = {
+        "provider": "openai-compatible",
+        "base_url": "https://chat-runtime.example/v1",
+        "api_key": "runtime-secret-value",
+        "model": "runtime-chat-model",
+        "timeout_seconds": 42,
+        "max_tokens": 2048,
+        "enable_thinking": False,
+    }
+    saved = await system_admin.put(f"{PREFIX}/models/chat/configuration", json=payload)
+    assert saved.status_code == 200, saved.text
+    assert "runtime-secret-value" not in saved.text
+    assert saved.json()["values"]["model"] == "runtime-chat-model"
+    assert get_settings().llm_base_url == "https://chat-runtime.example/v1"
+    assert get_settings().llm_api_key == "runtime-secret-value"
+
+    inventory = await system_admin.get(f"{PREFIX}/models/configuration")
+    assert inventory.status_code == 200
+    assert "runtime-secret-value" not in inventory.text
+    assert "chat" in inventory.json()["overridden_kinds"]
+
+    # Omitting the key keeps the current write-only value.
+    retained = await system_admin.put(
+        f"{PREFIX}/models/chat/configuration",
+        json={**payload, "api_key": "", "model": "runtime-chat-model-2"},
+    )
+    assert retained.status_code == 200
+    assert get_settings().llm_api_key == "runtime-secret-value"
+    assert get_settings().llm_model == "runtime-chat-model-2"
+
+    reset = await system_admin.delete(f"{PREFIX}/models/chat/configuration")
+    assert reset.status_code == 200
+    assert "chat" not in (await system_admin.get(f"{PREFIX}/models/configuration")).json()[
+        "overridden_kinds"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_volcengine_tts_configuration_is_saved_without_exposing_key(
+    system_admin: AsyncClient,
+) -> None:
+    payload = {
+        "protocol": "volcengine",
+        "base_url": "https://openspeech.bytedance.com",
+        "api_key": "volcengine-secret-key",
+        "model": "seed-tts-2.0",
+        "voice": "authorized-speaker",
+        "timeout_seconds": 20,
+        "streaming_enabled": True,
+    }
+    saved = await system_admin.put(f"{PREFIX}/models/tts/configuration", json=payload)
+    assert saved.status_code == 200, saved.text
+    assert "volcengine-secret-key" not in saved.text
+    assert saved.json()["values"]["protocol"] == "volcengine"
+    assert saved.json()["values"]["model"] == "seed-tts-2.0"
+    assert get_settings().tts_protocol == "volcengine"
+    assert get_settings().tts_api_key == "volcengine-secret-key"
+    inventory = await system_admin.get(f"{PREFIX}/models/configuration")
+    assert "volcengine-secret-key" not in inventory.text
+
+
+@pytest.mark.asyncio
+async def test_fallback_chat_and_reranker_configuration_are_write_only(
+    system_admin: AsyncClient,
+) -> None:
+    fallback = await system_admin.put(
+        f"{PREFIX}/models/chat_fallback/configuration",
+        json={
+            "base_url": "https://fallback.example/v1",
+            "api_key": "fallback-secret",
+            "model": "fallback-model",
+            "timeout_seconds": 25,
+            "max_tokens": 1536,
+        },
+    )
+    reranker = await system_admin.put(
+        f"{PREFIX}/models/reranker/configuration",
+        json={
+            "enabled": True,
+            "base_url": "https://rerank.example/v1",
+            "api_key": "rerank-secret",
+            "model": "rerank-model",
+            "timeout_seconds": 15,
+            "candidate_k": 10,
+        },
+    )
+
+    assert fallback.status_code == 200
+    assert reranker.status_code == 200
+    assert "fallback-secret" not in fallback.text
+    assert "rerank-secret" not in reranker.text
+    assert get_settings().fallback_llm_model == "fallback-model"
+    assert get_settings().reranker_enabled is True
+    assert get_settings().reranker_candidate_k == 10
 
 
 @pytest.mark.asyncio
@@ -163,7 +280,13 @@ async def test_system_prompt_and_speech_require_admin_and_persist(
     assert (await system_admin.put(f"{PREFIX}/speech", json=settings)).json() == settings
     public = await system_admin.get("/api/v1/speech/settings", headers={"X-Admin-Token": ""})
     assert public.status_code == 200
-    assert public.json() == settings
+    assert public.json() == {
+        **settings,
+        "streaming_enabled": False,
+        "stream_format": "pcm_s16le",
+        "stream_sample_rate": 24000,
+        "stream_channels": 1,
+    }
     assert (await system_admin.get(f"{PREFIX}/speech")).json() == settings
     invalid = await system_admin.put(f"{PREFIX}/speech", json={**settings, "rate": 100})
     assert invalid.status_code == 422
@@ -260,6 +383,45 @@ async def test_cloud_inventory_and_probe_available_while_browser_selected(
     assert draft.status_code == 200
     assert received == ["anna", "custom:voice"]
     assert (await system_admin.get(f"{PREFIX}/speech")).json()["provider"] == "browser"
+
+
+@pytest.mark.asyncio
+async def test_streaming_tts_probe_reports_first_audio_latency(
+    system_admin: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from medical_agent.modules.system import model_service
+
+    settings = Settings.model_construct(
+        tts_protocol="azure-speech",
+        tts_base_url="https://eastasia.tts.speech.microsoft.com",
+        tts_api_key="private-key",
+        tts_voice="zh-CN-XiaoxiaoNeural",
+        tts_streaming_enabled=True,
+    )
+    monkeypatch.setattr(system_router, "get_settings", lambda: settings)
+
+    class ProbeStream:
+        async def iter_bytes(self) -> AsyncIterator[bytes]:
+            yield b"\x00\x00" * 1200
+            yield b"\x01\x00" * 1200
+
+    async def open_stream(
+        text: str, preferences: SpeechSettings, current: Settings,
+    ) -> ProbeStream:
+        assert text == "语音服务测试。"
+        assert preferences.provider in {"browser", "openai-compatible"}
+        assert current is settings
+        return ProbeStream()
+
+    monkeypatch.setattr(model_service, "open_synthesis_stream", open_stream)
+    response = await system_admin.post(f"{PREFIX}/models/tts/probe")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "healthy"
+    assert payload["detail"]["streaming"] is True
+    assert payload["detail"]["audio_bytes"] == 4800
+    assert payload["detail"]["first_audio_ms"] is not None
 
 
 @pytest.mark.asyncio

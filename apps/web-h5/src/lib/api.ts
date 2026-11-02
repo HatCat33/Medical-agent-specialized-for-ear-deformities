@@ -12,6 +12,16 @@ import type {
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 const VISITOR_KEY = "medical-agent-visitor-id";
 
+export interface WeComJsSdkConfiguration {
+  corp_id: string;
+  agent_id: string;
+  timestamp: number;
+  nonce: string;
+  signature: string;
+  agent_signature: string;
+  url: string;
+}
+
 function createVisitorId(): string {
   if (typeof crypto.randomUUID === "function") {
     return `web-${crypto.randomUUID()}`;
@@ -158,13 +168,31 @@ async function streamMessage(
 }
 
 export const api = {
+  wecomJsSdkConfiguration: (url: string) =>
+    request<WeComJsSdkConfiguration>(`/channels/wecom-h5/js-sdk-config?url=${encodeURIComponent(url)}`),
   synthesizeSpeech: async (text: string, signal: AbortSignal): Promise<Blob> => {
     const response = await fetch(`${API_BASE}/speech/syntheses`, {
       method: "POST", signal, headers: { "Content-Type": "application/json", "X-Visitor-ID": visitorId() },
       body: JSON.stringify({ text }),
     });
-    if (!response.ok) throw new Error("speech_synthesis_failed");
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as { detail?: unknown } | null;
+      const detail = typeof payload?.detail === "string" ? payload.detail : "unknown";
+      throw new Error(`speech_synthesis_failed:${response.status}:${detail}`);
+    }
     return response.blob();
+  },
+  streamSpeech: async (text: string, signal: AbortSignal): Promise<ReadableStream<Uint8Array>> => {
+    const response = await fetch(`${API_BASE}/speech/syntheses/stream`, {
+      method: "POST", signal, headers: { "Content-Type": "application/json", "X-Visitor-ID": visitorId() },
+      body: JSON.stringify({ text }),
+    });
+    if (!response.ok || !response.body) {
+      const payload = (await response.json().catch(() => null)) as { detail?: unknown } | null;
+      const detail = typeof payload?.detail === "string" ? payload.detail : "unknown";
+      throw new Error(`speech_stream_failed:${response.status}:${detail}`);
+    }
+    return response.body;
   },
   speechSettings: <T>() => request<T>("/speech/settings"),
   listConversations: () => request<Conversation[]>("/conversations"),

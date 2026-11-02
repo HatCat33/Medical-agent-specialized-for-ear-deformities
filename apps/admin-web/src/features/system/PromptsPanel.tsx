@@ -104,8 +104,8 @@ export function PromptsPanel({ token }: { token: string }) {
       <Alert type="info" showIcon message={inventory.using_default ? "当前使用代码内置默认提示词。创建草稿并发布后才会影响患者问答。" : `当前已发布：${inventory.effective?.name ?? ""}`} />
       <section className="knowledge-section">
         <div className="section-heading">
-          <div><h2>提示词版本</h2><span>草稿保存不会影响患者端，只有发布操作会切换运行版本</span></div>
-          <Button type="primary" loading={busy} onClick={() => void createDraft()}>基于当前版本创建草稿</Button>
+          <div><h2>提示词版本</h2><span>草稿 {inventory.draft_count}/{inventory.draft_limit} · 保存不会影响患者端，只有发布操作会切换运行版本</span></div>
+          <Button type="primary" disabled={inventory.draft_count >= inventory.draft_limit} loading={busy} onClick={() => void createDraft()}>基于当前版本创建草稿</Button>
         </div>
         <Table<PromptRelease> rowKey="id" size="small" pagination={{ pageSize: 6 }} dataSource={inventory.items} columns={[
           { title: "版本名称", dataIndex: "name", render: (value: string, row) => <Button type="link" className="table-link" onClick={() => choose(row)}>{value}</Button> },

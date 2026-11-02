@@ -10,16 +10,23 @@ from medical_agent.api.dependencies import require_admin_token
 from medical_agent.core.config import get_settings
 from medical_agent.core.database import get_db
 from medical_agent.modules.speech.synthesis import (
+    effective_model,
     effective_voice,
     is_configured,
     synthesize,
     voice_options,
 )
-from medical_agent.modules.system import model_service, prompt_service, speech_service
+from medical_agent.modules.system import (
+    model_config_service,
+    model_service,
+    prompt_service,
+    speech_service,
+)
 from medical_agent.modules.system.model_service import MODEL_KINDS
 from medical_agent.modules.system.models import AdminOperation
 from medical_agent.modules.system.probe_diagnostics import failure_detail
 from medical_agent.modules.system.schemas import (
+    ModelConfigurationUpdate,
     PromptCreate,
     PromptUpdate,
     SpeechPreviewRequest,
@@ -48,13 +55,22 @@ async def system_operations(db: Db, page: int = Query(default=1, ge=1)) -> dict[
 
 @router.get("/prompts")
 async def prompts(db: Db) -> dict[str, Any]:
-    return await prompt_service.list_prompts(db)
+    result = await prompt_service.list_prompts(db)
+    result.update(
+        draft_limit=get_settings().prompt_draft_limit,
+        draft_count=sum(item["status"] == "draft" for item in result["items"]),
+    )
+    return result
 
 
 @router.post("/prompts", status_code=201)
 async def create_prompt(payload: PromptCreate, db: Db) -> dict[str, Any]:
     return prompt_service.prompt_view(
-        await prompt_service.create_prompt(db, **payload.model_dump())
+        await prompt_service.create_prompt(
+            db,
+            **payload.model_dump(),
+            draft_limit=get_settings().prompt_draft_limit,
+        )
     )
 
 
@@ -81,6 +97,27 @@ async def models(db: Db) -> dict[str, Any]:
     return await model_service.model_inventory(db, get_settings())
 
 
+@router.get("/models/configuration")
+async def model_configuration(db: Db) -> dict[str, Any]:
+    return await model_config_service.list_configuration(db)
+
+
+@router.put("/models/{kind}/configuration")
+async def update_model_configuration(
+    kind: str, payload: ModelConfigurationUpdate, db: Db
+) -> dict[str, Any]:
+    if kind not in model_config_service.KIND_FIELDS:
+        raise HTTPException(404, "model_kind_not_found")
+    return await model_config_service.save_configuration(db, kind=kind, payload=payload)
+
+
+@router.delete("/models/{kind}/configuration")
+async def reset_model_configuration(kind: str, db: Db) -> dict[str, Any]:
+    if kind not in model_config_service.KIND_FIELDS:
+        raise HTTPException(404, "model_kind_not_found")
+    return await model_config_service.reset_configuration(db, kind=kind)
+
+
 @router.get("/speech", response_model=SpeechSettings)
 async def speech_settings(db: Db) -> SpeechSettings:
     return await speech_service.read_settings(db)
@@ -91,11 +128,12 @@ async def speech_provider() -> dict[str, Any]:
     settings = get_settings()
     return {
         "configured": is_configured(settings),
-        "model": settings.tts_model,
-        "default_voice": settings.tts_voice,
+        "protocol": settings.tts_protocol,
+        "model": effective_model(settings),
+        "default_voice": effective_voice(SpeechSettings(), settings),
         "effective_default_voice": effective_voice(SpeechSettings(), settings),
         "voice_options": voice_options(settings),
-        "endpoint_host": model_service.safe_host(settings.tts_base_url),
+        "endpoint_host": "本机 CPU" if settings.tts_protocol == "local-sherpa" else model_service.safe_host(settings.tts_base_url),
     }
 
 
@@ -107,14 +145,15 @@ async def speech_preview(payload: SpeechPreviewRequest, db: Db) -> Response:
     except Exception as exc:
         diagnostics = failure_detail(exc, "tts", settings)
         diagnostics.update(
-            model=settings.tts_model, voice=effective_voice(payload.settings, settings)
+            model=effective_model(settings), voice=effective_voice(payload.settings, settings)
         )
         prompt_service.audit(
             db, kind="speech_preview_failed", target_id="tts", status="failed", **diagnostics
         )
         await db.commit()
         raise HTTPException(502, {"code": "tts_preview_failed", **diagnostics}) from exc
-    return Response(content=audio, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+    media_type = "audio/wav" if settings.tts_protocol == "local-sherpa" else "audio/mpeg"
+    return Response(content=audio, media_type=media_type, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/speech/probe")

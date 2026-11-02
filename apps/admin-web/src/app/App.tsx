@@ -1,5 +1,5 @@
 import { ConfigProvider } from "antd";
-import { Activity, Database, FileText, FlaskConical, ListChecks, LogOut, MessageSquareText, ShieldCheck, Volume2 } from "lucide-react";
+import { Activity, Database, FileText, FlaskConical, ListChecks, LogOut, MessageSquareText, ShieldCheck } from "lucide-react";
 import { type FormEvent, useState } from "react";
 
 import { KnowledgeDashboard } from "../features/knowledge/KnowledgeDashboard";
@@ -61,7 +61,7 @@ function Login({ onAuthenticated }: { onAuthenticated: (token: string) => void }
 export function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem(TOKEN_KEY) ?? "");
   const [section, setSection] = useState<AdminSection>("overview");
-  const icons = { overview: Activity, versions: Database, chunks: FileText, tests: FlaskConical, prompts: MessageSquareText, speech: Volume2, operations: ListChecks };
+  const icons = { overview: Activity, versions: Database, chunks: FileText, tests: FlaskConical, prompts: MessageSquareText, operations: ListChecks };
 
   function logout() {
     sessionStorage.removeItem(TOKEN_KEY);

@@ -32,6 +32,13 @@ class SpeechSettings(BaseModel):
     volume: float = Field(default=1, ge=0, le=1)
 
 
+class PublicSpeechSettings(SpeechSettings):
+    streaming_enabled: bool = False
+    stream_format: Literal["pcm_s16le"] = "pcm_s16le"
+    stream_sample_rate: int = Field(default=24_000, ge=8_000, le=96_000)
+    stream_channels: int = Field(default=1, ge=1, le=2)
+
+
 class SynthesisRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
@@ -40,3 +47,26 @@ class SynthesisRequest(BaseModel):
 
 class SpeechPreviewRequest(SynthesisRequest):
     settings: SpeechSettings
+
+
+class ModelConfigurationUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid", allow_inf_nan=False)
+
+    provider: str | None = Field(default=None, max_length=80)
+    base_url: str | None = Field(default=None, max_length=2000)
+    api_key: str | None = Field(default=None, max_length=8000)
+    model: str | None = Field(default=None, max_length=500)
+    timeout_seconds: float | None = Field(default=None, gt=0, le=300)
+    max_tokens: int | None = Field(default=None, ge=1, le=100_000)
+    enable_thinking: bool | None = None
+    language: str | None = Field(default=None, min_length=2, max_length=35)
+    batch_size: int | None = Field(default=None, ge=1, le=256)
+    voice: str | None = Field(default=None, max_length=500)
+    protocol: Literal[
+        "openai-compatible", "azure-speech", "elevenlabs", "volcengine", "custom",
+        "local-sherpa",
+    ] | None = None
+    streaming_enabled: bool | None = None
+    retry_count: int | None = Field(default=None, ge=0, le=3)
+    enabled: bool | None = None
+    candidate_k: int | None = Field(default=None, ge=1, le=100)

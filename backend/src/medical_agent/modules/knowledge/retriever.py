@@ -18,6 +18,10 @@ from medical_agent.providers.embedding.client import (
     EmbeddingProviderError,
     build_embedding_provider,
 )
+from medical_agent.providers.rerank.client import (
+    RerankerProviderError,
+    build_reranker_provider,
+)
 
 
 def _tokens(text: str) -> set[str]:
@@ -135,13 +139,46 @@ async def retrieve_detailed(
             except (TypeError, ValueError, json.JSONDecodeError):
                 if "invalid_stored_vectors_using_lexical" not in warnings:
                     warnings.append("invalid_stored_vectors_using_lexical")
-        scores[entry.id] = {"lexical": round(lexical, 4), "semantic": semantic}
+        scores[entry.id] = {
+            "lexical": round(lexical, 4),
+            "semantic": semantic,
+            "rerank": None,
+        }
         if score >= settings.rag_min_score:
             scored.append((score, entry))
     scored.sort(key=lambda item: (-item[0], item[1].source_row))
     if scored:
         relative_floor = scored[0][0] * settings.rag_relative_score
         scored = [item for item in scored if item[0] >= relative_floor]
+    candidate_limit = max(
+        settings.rag_top_k,
+        settings.reranker_candidate_k if settings.reranker_enabled and not lexical_only else 0,
+    )
+    candidates = scored[:candidate_limit]
+    mode = "hybrid" if query_vector is not None else "lexical"
+    reranker = build_reranker_provider(settings) if not lexical_only else None
+    if reranker is not None and candidates:
+        documents = [
+            f"标准问题：{entry.question}\n其他问法：{entry.aliases}\n答案：{entry.answer}"
+            for _, entry in candidates
+        ]
+        try:
+            reranked = await reranker.rerank(
+                query=query,
+                documents=documents,
+                top_n=settings.rag_top_k,
+            )
+            candidates = [
+                (item.score, candidates[item.index][1])
+                for item in reranked
+            ]
+            for item in reranked:
+                entry = scored[item.index][1] if item.index < len(scored) else None
+                if entry is not None:
+                    scores[entry.id]["rerank"] = round(item.score, 4)
+            mode = "hybrid_reranked" if query_vector is not None else "lexical_reranked"
+        except RerankerProviderError:
+            warnings.append("reranker_request_failed_using_base_ranking")
     hits = [
         RetrievalHit(
             entry_id=entry.id,
@@ -153,12 +190,12 @@ async def retrieve_detailed(
             source_row=entry.source_row,
             score=round(score, 4),
         )
-        for score, entry in scored[: settings.rag_top_k]
+        for score, entry in candidates[: settings.rag_top_k]
     ]
     return RetrievalResult(
         hits,
         {hit.entry_id: scores[hit.entry_id] for hit in hits},
-        "hybrid" if query_vector is not None else "lexical",
+        mode,
         warnings,
         round((perf_counter() - started) * 1000, 2),
     )

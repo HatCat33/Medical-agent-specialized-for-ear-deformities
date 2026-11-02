@@ -25,7 +25,8 @@ try {
       await expect(page.getByRole("row").filter({ hasText: label }).getByRole("button", { name: "探活", exact: true })).toBeEnabled();
     }
     await page.screenshot({ path: `.artifacts/visual-check/${width}-tts-inventory.png`, fullPage: true });
-    await page.getByRole("button", { name: "声音设置", exact: true }).click();
+    await page.getByLabel("配置云端语音合成").click();
+    await page.getByRole("tab", { name: "音色与播报" }).click();
     await page.locator('.ant-select[aria-label="播报方式"]').click();
     await page.locator(".ant-select-dropdown").getByText("云端语音 · 自定义音色", { exact: true }).click();
     await expect(page.getByRole("button", { name: "探活当前音色" })).toBeVisible();

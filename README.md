@@ -14,18 +14,18 @@
 - FastAPI 会话接口与 SQLite / Docker PostgreSQL 持久化。
 - 新建、查看、删除历史会话，以及匿名访客隔离。
 - OpenAI-compatible Chat Completions 模型接入。
-- 从模型到浏览器的 SSE 流式输出、停止生成和部分回答保存。
+- 从模型到浏览器的 SSE 流式输出、停止生成、部分回答保存，以及首包前断线后的后台续答落库；前端按会话与回答任务隔离迟到回调和语音队列，后台同步不会串入当前会话。
 - Markdown 安全渲染，不执行模型返回的原始 HTML。
 - 单次最多四张 JPG、PNG、WebP、HEIC 或 HEIF 图片；手机系统统一提供拍照或相册来源，支持图片加文字的视觉问答。
 - 图片私有存储、访客归属校验、历史回看及随会话删除。
-- 按住录音、松开转写并自动发送；回答生成时按完整句流式播报，支持设备音色或兼容接口的云端 TTS。
+- 按住录音、松开转写并自动发送；回答生成时按自然短句同步合成、预取和播报，支持设备音色或兼容接口的云端 TTS，并适配手机浏览器的音频播放限制。
 - 请求、媒体、会话和模型事件的结构化轮转日志。
 - 独立问答追踪日志，将输入、输出、模型、RAG 命中、耗时、状态及错误关联到同一次交互。
 - 医院 FAQ XLSX 只读校验、冲突检测、版本发布及关键词/可选向量混合检索。
 - 顶部导航管理端：运行总览与交互次数、知识版本、chunk 查看/编辑/删除、XLSX 增量合并、后台向量任务、发布回退与操作记录。
 - 管理端检索实验与批量标注评测：默认从标准问题按分类均衡生成，支持命中率、Recall@K、MRR、无结果准确率、报告保存和导出。
 - 版本化提示词管理：系统与业务提示词均支持草稿、发布和历史回退，患者问答实时采用当前发布版本；独立医疗风险规则仍由安全模块执行。
-- 文本、视觉、ASR、Embedding 与浏览器 TTS 配置总览，以及显式手动模型探活；API Key 不返回管理端。
+- 主文本、备用文本、视觉、ASR、Embedding、Rerank 与 TTS 配置、运行时修改和显式手动探活；API Key 只允许写入，不返回管理端。
 - Docker PostgreSQL 部署、Alembic 结构迁移、SQLite 数据复制及逐表行数核对。
 - 检索上下文与生成模型解耦，后端保留知识来源关联供评测和排障，患者端不展示参考资料；低召回时可禁止通用模型补答。
 - 急症提示以及诊断、分型、处方和手术判定请求的基础边界控制。
@@ -122,6 +122,8 @@ Vite 开发服务器只用于开发和演示，不应直接用于医院生产环
 
 ## 接入正式模型
 
+语音低延迟本地调试、CPU 模型安装和真实浏览器复测见 [流式语音说明](docs/operations/streaming-tts.md)。
+
 编辑 `backend/.env`：
 
 ```dotenv
@@ -129,6 +131,10 @@ LLM_PROVIDER=openai-compatible
 LLM_BASE_URL=https://your-provider.example/v1
 LLM_API_KEY=replace-me
 LLM_MODEL=replace-me
+LLM_RETRY_COUNT=1
+FALLBACK_LLM_BASE_URL=https://your-fallback-provider.example/v1
+FALLBACK_LLM_API_KEY=replace-me
+FALLBACK_LLM_MODEL=replace-with-a-fallback-model
 
 VISION_BASE_URL=https://your-provider.example/v1
 VISION_API_KEY=replace-me
@@ -139,9 +145,18 @@ ASR_BASE_URL=https://your-provider.example/v1
 ASR_API_KEY=replace-me
 ASR_MODEL=replace-with-an-asr-model
 ASR_LANGUAGE=
+
+TTS_PROTOCOL=azure-speech
+TTS_BASE_URL=https://your-region.tts.speech.microsoft.com
+TTS_API_KEY=replace-me
+TTS_MODEL=
+TTS_VOICE=zh-CN-XiaoxiaoNeural
+TTS_STREAMING_ENABLED=true
+TTS_STREAM_SAMPLE_RATE=24000
+TTS_STREAM_CHANNELS=1
 ```
 
-文本与视觉模型服务需兼容 OpenAI Chat Completions 流式接口，ASR 服务需兼容 `POST /audio/transcriptions`。图片请求只会发送到独立配置的视觉模型；未配置 `VISION_*` 时图片仍会进入历史，但不会误发给纯文本模型。`VISION_ENABLE_THINKING` 只应为明确支持该参数的视觉模型配置。密钥只能保存在本地环境变量、服务器密钥管理服务或 CI Secret 中，禁止提交到 Git。
+文本与视觉模型服务需兼容 OpenAI Chat Completions 流式接口，ASR 服务需兼容 `POST /audio/transcriptions`。TTS 支持 `openai-compatible`、`azure-speech`、`elevenlabs` 和可配置字段的 `custom` 协议；开启流式前必须确认服务返回原始 PCM s16le 字节流，患者端会边接收边播放，失败时自动降级为 MP3 短句和设备语音。图片请求只会发送到独立配置的视觉模型；未配置 `VISION_*` 时图片仍会进入历史，但不会误发给纯文本模型。`VISION_ENABLE_THINKING` 只应为明确支持该参数的视觉模型配置。密钥可保存在 `backend/.env`，也可由管理端写入服务器数据库的运行时配置；接口和页面不会返回明文。生产环境必须限制数据库及备份访问，禁止将密钥提交到 Git。
 
 ## 导入医院 FAQ 并启用 RAG
 
@@ -153,6 +168,12 @@ RAG_TOP_K=4
 RAG_MIN_SCORE=0.16
 RAG_RELATIVE_SCORE=0.62
 RAG_REQUIRE_MATCH=true
+
+RERANKER_ENABLED=false
+RERANKER_BASE_URL=https://your-reranker.example/v1
+RERANKER_API_KEY=replace-me
+RERANKER_MODEL=replace-with-a-rerank-model
+RERANKER_CANDIDATE_K=12
 
 EMBEDDING_BASE_URL=https://your-provider.example/v1
 EMBEDDING_API_KEY=replace-me
@@ -182,7 +203,7 @@ uv run python scripts/rebuild_faq_embeddings.py --rebuild-all
 
 如果存在同一问题对应不同答案，默认拒绝发布。完成医学审核后，可以修订原文件再导入；也可显式使用 `--exclude-conflicts` 排除冲突行并发布其余内容。医院 XLSX、数据库及检索索引不得提交到 Git。
 
-以后切换到自有微调模型时，只需让服务兼容 OpenAI Chat Completions，并替换 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_MODEL`。知识导入、检索、引用及安全模块无需重写。
+以后切换到自有微调模型时，只需让服务兼容 OpenAI Chat Completions，并替换 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_MODEL`。主接口在首个输出片段前失败时默认重试一次，随后才使用 `FALLBACK_LLM_*`；已经产生输出后不会切换，避免重复回答。Rerank 接口兼容常见的 `POST /rerank` 请求与 `results[index, relevance_score]` 响应。知识导入、检索及安全模块无需重写。
 
 ## 知识库管理端
 
@@ -199,7 +220,7 @@ cd F:\medical_agent
 pnpm dev:admin -- --host 127.0.0.1
 ```
 
-访问 `http://127.0.0.1:5174`，输入管理员令牌。顶部统一导航提供运行总览、知识版本、chunk 内容管理、检索评测、提示词管理、声音设置和任务记录。运行总览集中展示聊天、视觉、ASR、Embedding、TTS 与各自的探活按钮。知识建议流程：复制草稿 → 导入/编辑 → 补全向量 → 评测 → 发布。系统提示词和业务提示词一同版本化，草稿保存不生效，发布后新问答立即采用；独立医疗风险规则仍由安全模块执行。提示词和声音设置修改均校验现有 `ADMIN_API_TOKEN`，并写入系统操作审计。模型地址脱敏，不返回 API Key；探活必须手动触发，视觉与 ASR 测试可能产生少量供应商调用。全量向量重建只允许草稿；管理员令牌保存在当前标签页的 `sessionStorage`。
+访问 `http://127.0.0.1:5174`，输入管理员令牌。顶部统一导航提供运行总览、知识版本、chunk 内容管理、检索评测、提示词管理和任务记录；音色、自动播报、语速及试听统一放在运行总览 → 语音合成 → 配置 → 音色与播报。运行总览集中展示聊天、视觉、ASR、Embedding、TTS，可单独编辑模型名、服务地址、超时等参数并手动探活；API Key 只写不读，单项“恢复默认”会回到 `backend/.env`。知识建议流程：复制草稿 → 导入/编辑 → 补全向量 → 评测 → 发布。检索与评测页提供真实患者链路的临时多轮测试，验证 RAG、提示词、上下文和滚动摘要，测试结束自动清理且不计入患者交互次数；各类详细结果从右侧抽屉查看。系统提示词和业务提示词一同版本化，草稿保存不生效，发布后新问答立即采用；独立医疗风险规则仍由安全模块执行。配置修改均校验现有 `ADMIN_API_TOKEN` 并写入系统操作审计。探活和多轮测试可能产生模型调用费用。全量向量重建只允许草稿；管理员令牌保存在当前标签页的 `sessionStorage`。
 
 已有数据库升级到本版时，在 `backend` 目录执行 `uv run python scripts/upgrade_database.py`，然后重新启动后端。SQLite 会先生成一致性备份；迁移兼容开发环境已创建声音设置表或上次迁移部分完成的状态，保留原提示词与已有设置。
 
@@ -212,8 +233,9 @@ pnpm dev:admin -- --host 127.0.0.1
 - 多轮记忆仅限当前会话：最近 20 条消息保留原文，更早内容每累计 8 条滚动压缩为会话摘要；未达到批次或摘要失败时旧消息仍按原文带入，不会产生记忆空档。历史图片从整个当前会话独立选择最近 4 张，不受文字窗口限制，也不会跨会话复用。
 - 企业微信智能机器人 API 模式支持文字、语音转写、图片/图文混排输入和流式回复，无需公网回调地址；配置与单 worker 部署方法见 [企业微信机器人接入](docs/operations/wecom-bot.md)。
 - 微信客服作为独立回调渠道支持客户文字、图片和 AMR 语音输入，复用现有 RAG、安全、多轮上下文、图片上下文、历史记录与问答日志；需要公网 HTTPS 回调、持久化游标和数据库迁移，详见 [微信客服接入](docs/operations/wechat-kf.md)。
+- 企业微信内嵌患者 H5 可通过 JS-SDK 原生选择相册并一次选择多张图片；使用独立自建应用凭据和受限域名签名，详见 [企业微信 H5 图片多选接入](docs/operations/wecom-h5.md)。
 - 浏览器只负责临时录音，后端调用 `ASR_*` 配置的模型完成转写；原始麦克风音频默认不落盘，只保存转写后发送的文字。
-- 回答播报支持浏览器设备 TTS 或兼容接口的云端 TTS，不保存音频文件。新回答随模型流式输出按完整句尽早播报，云端音频按序预加载；顶部声音键记住静音偏好，历史消息不自动朗读。后台支持音色与播报参数、试听；云端通过 `TTS_*` 配置，支持填写供应商已创建的自定义/克隆音色 ID。创建或训练音色仍在供应商侧完成。部分手机浏览器需用户手势或音频权限才能播放。
+- 回答播报支持浏览器设备 TTS 或兼容接口的云端 TTS，不保存音频文件。新回答随模型流式输出按自然短句尽早播报，云端音频按序预取；顶部声音键记住静音偏好，历史消息不自动朗读。后台支持音色与播报参数、试听；云端通过 `TTS_*` 配置，支持填写供应商已创建的自定义/克隆音色 ID。创建或训练音色仍在供应商侧完成。部分手机浏览器需用户手势或音频权限才能播放。
 - 应用日志写入 `LOG_FILE_PATH`，默认单文件 10 MB、保留 10 个轮转文件，不记录问题正文、转写文字或图片内容。
 - 问答追踪日志写入 `INTERACTION_LOG_FILE_PATH`，默认是 `backend/logs/interactions.jsonl`；每行是一条完整 JSON 记录，可通过 `interaction_id`、`conversation_id` 和消息 ID 定位一次问答，并包含实际使用的提示词版本 ID 与校验值。
 - 如在 `backend/.env` 启用 `INTERACTION_LOG_INCLUDE_CONTENT=true`，问答追踪日志会保存用户文字和模型完整回答；图片只记录媒体 ID、类型和数量，不保存二进制内容，原始录音仍不落盘。模板默认关闭正文记录。

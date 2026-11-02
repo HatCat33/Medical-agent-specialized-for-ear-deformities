@@ -33,6 +33,9 @@ const errorMessages: Record<string, string> = {
   embedding_request_failed: "Embedding 服务请求失败",
   embedding_count_mismatch: "Embedding 服务返回的向量数量与文本数量不一致",
   embedding_response_invalid: "Embedding 服务返回格式无效",
+  knowledge_draft_limit_reached: "知识草稿数量已达到上限，请先发布或删除现有草稿",
+  reranker_request_failed: "Rerank 服务请求失败",
+  reranker_response_invalid: "Rerank 服务返回格式无效",
   xlsx_required: "请上传 .xlsx 格式的 Excel 文件",
   invalid_faq_xlsx: "文件无法解析。请检查 XLSX 文件是否损坏，以及首个工作表是否包含：分类、标准问题、答案内容",
   faq_has_invalid_rows: "表格中存在缺少分类、标准问题或答案内容的非空行，请修正后重新导入",
@@ -41,6 +44,7 @@ const errorMessages: Record<string, string> = {
   prompt_release_not_found: "提示词版本不存在",
   prompt_release_not_editable: "仅草稿提示词可以编辑",
   prompt_release_not_deletable: "仅草稿提示词可以删除",
+  prompt_draft_limit_reached: "提示词草稿数量已达到上限，请先发布或删除现有草稿",
   model_not_configured: "该模型服务尚未配置完整",
   probe_timeout: "模型探活超时",
   probe_failed: "模型探活失败",
@@ -95,6 +99,8 @@ export interface Overview {
   embedding_model: string; rag_top_k: number; rag_min_score: number;
   rag_relative_score: number; chunk_strategy: string; vector_storage: string;
   interaction_count?: number; active_jobs: number;
+  reranker_enabled: boolean; reranker_configured: boolean; reranker_model: string;
+  knowledge_draft_limit: number; knowledge_draft_count: number;
 }
 export interface Release {
   id: string; name: string; source_name: string; status: string;
@@ -116,7 +122,7 @@ export interface Operation {
 export interface SearchHit {
   entry_id: string; question: string; answer: string; category: string;
   source_name: string; source_sheet: string; source_row: number;
-  score: number; lexical: number; semantic: number | null;
+  score: number; lexical: number; semantic: number | null; rerank: number | null;
 }
 export interface SearchResult {
   query: string; mode: string; warnings: string[]; latency_ms: number; hits: SearchHit[];
@@ -129,6 +135,7 @@ export interface PromptRelease {
 export interface PromptInventory {
   items: PromptRelease[]; effective: PromptRelease | null; effective_content: string;
   using_default: boolean; safety_baseline: string; effective_system_content: string;
+  draft_limit: number; draft_count: number;
 }
 export interface SpeechSettings {
   auto_play: boolean; voice: string; language: string; rate: number; pitch: number; volume: number;
@@ -136,6 +143,7 @@ export interface SpeechSettings {
 }
 
 export interface SpeechProviderInfo {
+  protocol?: string;
   configured: boolean; model: string; default_voice: string; endpoint_host: string;
   effective_default_voice: string; voice_options: { label: string; value: string }[];
 }
@@ -169,6 +177,12 @@ export interface ModelConfig {
   settings: Record<string, unknown>; last_probe: ModelProbe | null;
 }
 export interface ModelInventory { items: ModelConfig[]; note: string }
+export interface ModelConfigurationItem {
+  kind: string; values: Record<string, string | number | boolean | null>; api_key_configured: boolean;
+}
+export interface ModelConfigurationInventory {
+  items: ModelConfigurationItem[]; overridden_kinds: string[];
+}
 
 export function rebuildEmbeddings(
   token: string,

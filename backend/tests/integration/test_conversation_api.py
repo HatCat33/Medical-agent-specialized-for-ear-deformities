@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -80,6 +81,63 @@ async def api_client(
 
 
 @pytest.mark.asyncio
+async def test_create_reuses_one_empty_conversation_and_removes_old_duplicates(
+    api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    client, session_maker = api_client
+    headers = {"X-Visitor-ID": "visitor-empty-conversation-016"}
+    async with session_maker() as db:
+        first = await conversation_repository.create_conversation(db, owner_id=headers["X-Visitor-ID"])
+        second = await conversation_repository.create_conversation(db, owner_id=headers["X-Visitor-ID"])
+        newest_id = second.id
+        assert first.id != second.id
+        await db.commit()
+
+    created = await client.post("/api/v1/conversations", json={}, headers=headers)
+    assert created.status_code == 201
+    assert created.json()["id"] == newest_id
+    repeated = await client.post("/api/v1/conversations", json={}, headers=headers)
+    assert repeated.json()["id"] == newest_id
+    listed = await client.get("/api/v1/conversations", headers=headers)
+    assert [item["id"] for item in listed.json()] == [newest_id]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_before_first_token_finishes_answer_in_background(
+    api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, session_maker = api_client
+    monkeypatch.setattr(conversation_service, "session_factory", session_maker)
+    async with session_maker() as db:
+        conversation = await conversation_repository.create_conversation(
+            db, owner_id="visitor-disconnect-recovery"
+        )
+        await db.commit()
+        stream = conversation_service.stream_message(
+            db,
+            conversation=conversation,
+            content="断开后也要保存回答",
+        )
+        event, _ = await anext(stream)
+        assert event == "user_message"
+        assert conversation_service.is_generation_pending(conversation.id) is True
+        await stream.aclose()
+
+    pending = list(conversation_service._background_generations)
+    if pending:
+        await asyncio.gather(*pending)
+    async with session_maker() as db:
+        messages = await conversation_repository.list_messages(
+            db, conversation_id=conversation.id
+        )
+
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert "Demo 测试模式" in messages[-1].content
+    assert conversation_service.is_generation_pending(conversation.id) is False
+
+
+@pytest.mark.asyncio
 async def test_conversation_lifecycle_and_owner_isolation(
     api_client: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
 ) -> None:
@@ -89,6 +147,7 @@ async def test_conversation_lifecycle_and_owner_isolation(
 
     created = await client.post("/api/v1/conversations", json={}, headers=owner_headers)
     assert created.status_code == 201
+    assert created.json()["created_at"].endswith("Z")
     conversation_id = created.json()["id"]
 
     isolated = await client.get(f"/api/v1/conversations/{conversation_id}", headers=other_headers)
@@ -106,6 +165,7 @@ async def test_conversation_lifecycle_and_owner_isolation(
     assert payload["assistant_message"]["safety_code"] == "allowed"
     assert "Demo 测试模式" in payload["assistant_message"]["content"]
     assert payload["conversation"]["title"] == "第一次就诊前需要准备什么？"
+    assert payload["conversation"]["last_message_at"].endswith("Z")
 
     history = await client.get(f"/api/v1/conversations/{conversation_id}", headers=owner_headers)
     assert history.status_code == 200

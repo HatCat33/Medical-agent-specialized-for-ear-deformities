@@ -37,6 +37,7 @@ export interface Message {
 
 export interface ConversationDetail extends Conversation {
   messages: Message[];
+  generation_pending?: boolean;
 }
 
 export interface SendMessageResponse {

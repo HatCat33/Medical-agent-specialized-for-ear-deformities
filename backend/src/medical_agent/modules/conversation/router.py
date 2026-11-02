@@ -42,11 +42,15 @@ async def create_conversation(
     db: DbSession,
     owner_id: OwnerId,
 ) -> ConversationRead:
-    conversation = await repository.create_conversation(
-        db,
-        owner_id=owner_id,
-        title=(payload.title or "新会话").strip() or "新会话",
-    )
+    title = (payload.title or "新会话").strip() or "新会话"
+    if title == "新会话":
+        conversation = await repository.get_or_create_empty_conversation(
+            db, owner_id=owner_id, title=title,
+        )
+    else:
+        conversation = await repository.create_conversation(
+            db, owner_id=owner_id, title=title,
+        )
     await db.commit()
     await db.refresh(conversation)
     return ConversationRead.model_validate(conversation)
@@ -67,6 +71,7 @@ async def get_conversation(
     return ConversationDetail(
         **ConversationRead.model_validate(conversation).model_dump(),
         messages=[MessageRead.model_validate(message) for message in messages],
+        generation_pending=service.is_generation_pending(conversation.id),
     )
 
 

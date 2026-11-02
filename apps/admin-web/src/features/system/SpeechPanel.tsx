@@ -7,7 +7,7 @@ import { SpeechDiagnostics } from "./SpeechDiagnostics";
 import { ErrorNotice } from "../knowledge/ErrorNotice";
 import { errorText } from "../knowledge/shared";
 
-export function SpeechPanel({ token }: { token: string }) {
+export function SpeechPanel({ token, onSaved }: { token: string; onSaved?: () => void }) {
   const [settings, setSettings] = useState<SpeechSettings | null>(null);
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [error, setError] = useState("");
@@ -72,6 +72,7 @@ export function SpeechPanel({ token }: { token: string }) {
     try {
       await systemApi(token, "/speech", { method: "PUT", body: JSON.stringify(settings) });
       setSaved(true);
+      onSaved?.();
     } catch (reason) { setError(errorText(reason)); }
     finally { setBusy(false); }
   }
@@ -149,14 +150,14 @@ export function SpeechPanel({ token }: { token: string }) {
     if (settings.provider === "openai-compatible") {
       const controller = new AbortController(); previewRequest.current = controller;
       try {
-        setPreviewStatus("正在生成云端音频…");
+        setPreviewStatus("正在生成音频…");
         const blob = await speechPreview(token, preview, settings, controller.signal);
         if (controller.signal.aborted) return;
         previewUrl.current = URL.createObjectURL(blob);
         const audio = new Audio(previewUrl.current); audioRef.current = audio; audio.volume = settings.volume;
         audio.onended = stopPreview;
         audio.onerror = () => { stopPreview(); setError("音频无法播放，请检查供应商是否返回 MP3 音频。"); };
-        setPreviewStatus("正在播放云端音色");
+        setPreviewStatus("正在播放声音");
         await audio.play();
       } catch (reason) {
         if (!controller.signal.aborted) {
@@ -187,14 +188,16 @@ export function SpeechPanel({ token }: { token: string }) {
     {fallbackNotice && <Alert type="warning" showIcon message={fallbackNotice} />}
     {saved && <Alert type="success" showIcon message="声音设置已保存，患者端刷新后生效。" />}
     {settings && <section className="knowledge-section speech-settings">
-      <div className="section-heading"><div><h2>播报偏好</h2><span>默认声音与音色管理</span></div><Button type="primary" icon={<Save size={16} />} loading={busy} onClick={() => void save()}>保存设置</Button></div>
-      <div className="speech-provider-card"><strong>播报方式</strong><Select aria-label="播报方式" value={settings.provider} onChange={value => change({ provider: value })} options={[{ value: "browser", label: "设备语音 · 浏览器音色" }, { value: "openai-compatible", label: "云端语音 · 自定义音色" }]} />
+      <div className="section-heading"><div><h2>音色与播报</h2><span>患者端默认声音与试听</span></div><Button type="primary" icon={<Save size={16} />} loading={busy} onClick={() => void save()}>保存播报设置</Button></div>
+      <div className="speech-provider-card"><strong>播报方式</strong><Select aria-label="播报方式" value={settings.provider} onChange={value => change({ provider: value })} options={[{ value: "browser", label: "设备语音 · 浏览器音色" }, { value: "openai-compatible", label: provider?.protocol === "local-sherpa" ? "服务端语音 · 本地中文模型" : "云端语音 · 自定义音色" }]} />
         {settings.provider === "openai-compatible" && <>
           <div className="speech-cloud-summary"><span>{provider?.model || "尚未配置模型"}<small>{provider?.endpoint_host || "在 backend/.env 配置 TTS 服务后重启后端"}</small></span><Button icon={<Activity size={15} />} loading={probing} onClick={() => void probeCloud()}>探活当前音色</Button></div>
+          {provider?.protocol === "local-sherpa" ? <span className="muted">当前使用本地中文音色，无需云端密钥。可调整语速和音量；切换云端模型后可使用对应的自定义音色。</span> : <>
           {!!provider?.voice_options?.length && <label>预设音色<Select aria-label="云端预设音色" placeholder="选择预设，也可以在下方输入自定义 ID" value={provider.voice_options.some(item => item.value === settings.cloud_voice) ? settings.cloud_voice : undefined} options={provider.voice_options} onChange={cloud_voice => change({ cloud_voice })} /></label>}
           <label>自定义音色 ID<Input aria-label="云端音色 ID" value={settings.cloud_voice} placeholder={provider?.effective_default_voice || "填入供应商完整音色 ID"} maxLength={300} onChange={event => change({ cloud_voice: event.target.value })} /></label>
           <span className="muted">留空时使用后端默认：{provider?.effective_default_voice || "尚未设置 TTS_VOICE"}。探活与试听使用当前表单，保存后应用到患者端。</span>
           <span className="muted">音色需先在对应供应商创建或获得授权。此处接入已有音色 ID；模型、密钥保存在后端。云端支持语速和播放音量，音调由供应商音色决定。</span>
+          </>}
         </>}
       </div>
       <div className="speech-toggle-row"><div><strong>默认自动播报</strong><p>新回答生成时出声</p></div><Switch aria-label="默认自动播报" checked={settings.auto_play} onChange={auto_play => change({ auto_play })} /></div>

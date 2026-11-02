@@ -3,8 +3,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ChatPanel } from "../features/chat/ChatPanel";
 import { useAnswerSpeech } from "../features/chat/useAnswerSpeech";
 import { HistorySidebar } from "../features/history/HistorySidebar";
+import { DeleteConversationDialog } from "../features/history/DeleteConversationDialog";
 import { api } from "../lib/api";
 import { prepareImageForUpload } from "../lib/image";
+import { ProgressiveTextStream } from "../lib/progressiveStream";
 import {
   audioRecordingSupported,
   readableRecordingError,
@@ -27,6 +29,12 @@ const SIDEBAR_COLLAPSED_KEY = "medical-agent-sidebar-collapsed";
 interface SubmitOptions {
   content: string;
   inputMode: InputMode;
+}
+
+interface ActiveTurn {
+  id: string;
+  conversationId: string | null;
+  controller: AbortController;
 }
 
 function readableTranscriptionError(error: unknown): string {
@@ -53,12 +61,15 @@ export function App() {
   const [selectedImages, setSelectedImages] = useState<SelectedImage[]>([]);
   const [processingImages, setProcessingImages] = useState(false);
   const [sending, setSending] = useState(false);
+  const [syncingConversationId, setSyncingConversationId] = useState<string | null>(null);
   const [listening, setListening] = useState(false);
   const [recordingReady, setRecordingReady] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
   const [transcribing, setTranscribing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [deletingConversation, setDeletingConversation] = useState(false);
   const historyOpenRef = useRef(false);
   const appShellRef = useRef<HTMLElement>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(
@@ -71,6 +82,27 @@ export function App() {
   const recordingTimer = useRef<number | null>(null);
   const previewUrls = useRef(new Set<string>());
   const conversationCreation = useRef<Promise<Conversation> | null>(null);
+  const conversationOpenAttempt = useRef(0);
+  const syncingConversationRef = useRef<string | null>(null);
+  const activeTurnRef = useRef<ActiveTurn | null>(null);
+
+  const updateSyncingConversation = useCallback((conversationId: string | null) => {
+    syncingConversationRef.current = conversationId;
+    setSyncingConversationId(conversationId);
+  }, []);
+
+  const invalidateActiveTurn = useCallback(() => {
+    const turn = activeTurnRef.current;
+    activeTurnRef.current = null;
+    if (turn) {
+      turn.controller.abort();
+      playback.cancel(turn.id);
+      if (streamController.current === turn.controller) streamController.current = null;
+    } else {
+      playback.cancel();
+    }
+    setSending(false);
+  }, [playback]);
 
   useEffect(() => {
     historyOpenRef.current = historyOpen;
@@ -121,7 +153,7 @@ export function App() {
       velocityX = 0;
       dragOffset = historyOpenRef.current ? sidebarWidth() : 0;
       gesture = "pending";
-      eligible = historyOpenRef.current || startX <= Math.min(window.innerWidth * 0.45, 180);
+      eligible = historyOpenRef.current || startX <= Math.min(window.innerWidth * 0.68, 280);
     };
     const onTouchMove = (event: TouchEvent) => {
       if (!eligible || !window.matchMedia("(max-width: 760px)").matches || event.touches.length !== 1) return;
@@ -190,6 +222,8 @@ export function App() {
     setRecordingReady(false); setAudioLevel(0);
   }, []);
 
+  const readMessage = useCallback((content: string) => playback.read(content), [playback]);
+
   useEffect(
     () => () => {
       recordingAttempt.current += 1;
@@ -209,7 +243,9 @@ export function App() {
 
   const openConversation = useCallback(
     async (conversationId: string) => {
-      playback.cancel();
+      const attempt = ++conversationOpenAttempt.current;
+      invalidateActiveTurn();
+      updateSyncingConversation(null);
       setError(null);
       setInput("");
       setInputMode("text");
@@ -217,10 +253,50 @@ export function App() {
       clearSelectedImages();
       setActiveId(conversationId);
       setHistoryOpen(false);
-      const detail = await api.getConversation(conversationId);
+      const loadDetail = async () => {
+        try {
+          return await api.getConversation(conversationId);
+        } catch (reason) {
+          if (conversationOpenAttempt.current === attempt) updateSyncingConversation(null);
+          throw reason;
+        }
+      };
+      let detail = await loadDetail();
+      if (conversationOpenAttempt.current !== attempt) return;
       setMessages(detail.messages);
+      if (detail.messages.at(-1)?.role !== "user" || detail.generation_pending !== true) {
+        updateSyncingConversation(null);
+        if (detail.messages.at(-1)?.role === "user") {
+          setError("上一条回答未完成，你可以重新发送问题。");
+        }
+        return;
+      }
+      updateSyncingConversation(conversationId);
+      // A disconnected SSE request may still be finishing on the server. Refresh the
+      // open conversation until the recovered answer appears without a manual reload.
+      for (
+        let retry = 0;
+        retry < 120
+        && detail.messages.at(-1)?.role === "user"
+        && detail.generation_pending === true;
+        retry += 1
+      ) {
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+        if (conversationOpenAttempt.current !== attempt) return;
+        detail = await loadDetail();
+        if (conversationOpenAttempt.current !== attempt) return;
+        setMessages(detail.messages);
+      }
+      if (conversationOpenAttempt.current !== attempt) return;
+      if (detail.messages.at(-1)?.role === "user") {
+        setError(detail.generation_pending
+          ? "上一条回答同步超时，请稍后重新进入此会话查看。"
+          : "上一条回答未完成，你可以重新发送问题。",
+        );
+      }
+      updateSyncingConversation(null);
     },
-    [cancelRecording, clearSelectedImages, playback],
+    [cancelRecording, clearSelectedImages, invalidateActiveTurn, updateSyncingConversation],
   );
 
   useEffect(() => {
@@ -236,12 +312,17 @@ export function App() {
 
   async function createConversation(preserveComposer = false): Promise<Conversation> {
     if (conversationCreation.current) return conversationCreation.current;
-    if (!preserveComposer && activeId && messages.length === 0) {
-      const current = conversations.find((item) => item.id === activeId);
-      if (current) return current;
-    }
     if (!preserveComposer) {
-      playback.cancel();
+      const existingEmpty = conversations.find((item) => item.last_message_at === null);
+      if (existingEmpty) {
+        if (existingEmpty.id !== activeId) await openConversation(existingEmpty.id);
+        return existingEmpty;
+      }
+    }
+    // Invalidate any history-sync polling from the conversation being left.
+    conversationOpenAttempt.current += 1;
+    if (!preserveComposer) {
+      invalidateActiveTurn();
       setInput("");
       setInputMode("text");
       cancelRecording();
@@ -251,9 +332,14 @@ export function App() {
     conversationCreation.current = request;
     try {
       const conversation = await request;
-      setConversations((current) => [conversation, ...current]);
+      // The API reuses one empty conversation and removes older empty duplicates.
+      setConversations((current) => [
+        conversation,
+        ...current.filter((item) => item.id !== conversation.id && item.last_message_at !== null),
+      ]);
       setActiveId(conversation.id);
       setMessages([]);
+      updateSyncingConversation(null);
       setHistoryOpen(false);
       return conversation;
     } finally {
@@ -261,23 +347,30 @@ export function App() {
     }
   }
 
-  async function deleteConversation(conversationId: string) {
-    if (!window.confirm("确定删除这条会话、消息和上传的图片吗？")) return;
+  async function deleteConversation() {
+    const conversationId = pendingDeleteId;
+    if (!conversationId || deletingConversation) return;
+    setDeletingConversation(true);
     try {
       await api.deleteConversation(conversationId);
       const remaining = conversations.filter((item) => item.id !== conversationId);
       setConversations(remaining);
       if (activeId === conversationId) {
-        playback.cancel();
+        invalidateActiveTurn();
         if (remaining[0]) await openConversation(remaining[0].id);
         else {
+          conversationOpenAttempt.current += 1;
           setActiveId(null);
           setMessages([]);
+          updateSyncingConversation(null);
           clearSelectedImages();
         }
       }
+      setPendingDeleteId(null);
     } catch {
       setError("会话删除失败，请稍后重试。");
+    } finally {
+      setDeletingConversation(false);
     }
   }
 
@@ -333,6 +426,7 @@ export function App() {
   async function startVoiceRecording() {
     if (sending || transcribing || listening) return;
     playback.cancel();
+    playback.unlock();
     const attempt = recordingAttempt.current + 1;
     recordingAttempt.current = attempt;
     recordingReleasePending.current = false;
@@ -406,23 +500,43 @@ export function App() {
   async function submitMessage(options?: SubmitOptions) {
     const content = (options?.content ?? input).trim();
     const files = selectedImages.map((item) => item.file);
-    if ((!content && !files.length) || sending || processingImages) return;
-    playback.begin();
+    if (
+      (!content && !files.length)
+      || sending
+      || processingImages
+      || (
+        syncingConversationRef.current !== null
+        && syncingConversationRef.current === activeId
+      )
+    ) return;
     cancelRecording();
     setSending(true);
     setError(null);
     const controller = new AbortController();
+    const turn: ActiveTurn = {
+      id: crypto.randomUUID(),
+      conversationId: activeId,
+      controller,
+    };
+    activeTurnRef.current = turn;
     streamController.current = controller;
+    playback.begin(false, turn.id);
 
     let uploaded: MediaAttachment[] = [];
     let userPersisted = false;
     let userTemporaryId = "";
     let assistantTemporaryId = "";
+    let presenter: ProgressiveTextStream | null = null;
+    const completedMessage: { current: Message | null } = { current: null };
     try {
       if (files.length) uploaded = await api.uploadImages(files);
       const conversation = activeId
         ? conversations.find((item) => item.id === activeId) ?? (await createConversation(true))
         : await createConversation(true);
+      turn.conversationId = conversation.id;
+      if (activeTurnRef.current !== turn || controller.signal.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
       const displayContent = content || IMAGE_ONLY_QUESTION;
       const now = new Date().toISOString();
       const sequence = (messages.at(-1)?.sequence_no ?? 0) + 1;
@@ -453,6 +567,15 @@ export function App() {
       setInput("");
       setMessages((current) => [...current, userMessage, assistantMessage]);
       setActiveId(conversation.id);
+      presenter = new ProgressiveTextStream((chunk) => {
+        setMessages((current) =>
+          current.map((item) =>
+            item.id === assistantTemporaryId
+              ? { ...item, content: item.content + chunk }
+              : item,
+          ),
+        );
+      }, controller.signal);
 
       await api.streamMessage(
         conversation.id,
@@ -462,6 +585,7 @@ export function App() {
         {
           onUserMessage: (message) => {
             userPersisted = true;
+            if (activeTurnRef.current !== turn) return;
             clearSelectedImages();
             setInputMode("text");
             setMessages((current) =>
@@ -469,34 +593,45 @@ export function App() {
             );
           },
           onDelta: (chunk) => {
-            playback.append(chunk);
-            setMessages((current) =>
-              current.map((item) =>
-                item.id === assistantTemporaryId
-                  ? { ...item, content: item.content + chunk }
-                  : item,
-              ),
-            );
+            if (activeTurnRef.current !== turn) return;
+            playback.append(chunk, turn.id);
+            presenter?.push(chunk);
           },
           onDone: (message) => {
-            playback.finish();
-            setMessages((current) =>
-              current.map((item) => (item.id === assistantTemporaryId ? message : item)),
-            );
+            if (activeTurnRef.current !== turn) return;
+            completedMessage.current = message;
           },
         },
         controller.signal,
       );
+      if (activeTurnRef.current !== turn) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+      playback.finish(turn.id);
+      await presenter.finish();
+      if (activeTurnRef.current !== turn || controller.signal.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
+      if (!completedMessage.current) throw new Error("stream_ended_without_message");
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === assistantTemporaryId ? completedMessage.current! : item,
+        ),
+      );
     } catch (caught) {
-      playback.cancel();
+      presenter?.cancel();
+      playback.cancel(turn.id);
       const stopped = caught instanceof DOMException && caught.name === "AbortError";
+      const ownsTurn = activeTurnRef.current === turn;
       if (!userPersisted) {
-        setMessages((current) =>
-          current.filter((item) => item.id !== userTemporaryId && item.id !== assistantTemporaryId),
-        );
-        setInput(content);
+        if (ownsTurn) {
+          setMessages((current) =>
+            current.filter((item) => item.id !== userTemporaryId && item.id !== assistantTemporaryId),
+          );
+          setInput(content);
+        }
         await Promise.allSettled(uploaded.map((item) => api.deleteMedia(item.id)));
-      } else {
+      } else if (ownsTurn) {
         setMessages((current) =>
           current.map((item) => {
             if (item.id !== assistantTemporaryId) return item;
@@ -508,26 +643,32 @@ export function App() {
           }),
         );
       }
-      if (!stopped) setError(userPersisted
+      if (ownsTurn && !stopped) setError(userPersisted
         ? "回答连接中断，已保留发送成功的内容，请稍后重试。"
         : "暂时无法发送，输入内容已保留，请稍后重试。");
     } finally {
-      streamController.current = null;
-      setSending(false);
-      try {
-        await refreshConversations();
-      } catch {
-        // The current message remains usable even if refreshing the sidebar fails.
+      if (activeTurnRef.current === turn) {
+        activeTurnRef.current = null;
+        if (streamController.current === controller) streamController.current = null;
+        setSending(false);
+        try {
+          await refreshConversations();
+        } catch {
+          // The current message remains usable even if refreshing the sidebar fails.
+        }
       }
     }
   }
 
   function stopGeneration() {
-    playback.cancel();
-    streamController.current?.abort();
+    const turn = activeTurnRef.current;
+    if (!turn) return;
+    playback.cancel(turn.id);
+    turn.controller.abort();
   }
 
   const active = conversations.find((item) => item.id === activeId);
+  const syncing = syncingConversationId !== null && syncingConversationId === activeId;
 
   return (
     <main
@@ -552,7 +693,7 @@ export function App() {
         }}
         onCreate={() => void createConversation()}
         onSelect={(conversationId) => void openConversation(conversationId)}
-        onDelete={(conversationId) => void deleteConversation(conversationId)}
+        onDelete={setPendingDeleteId}
       />
       <button
         className="mobile-history-dismiss"
@@ -570,12 +711,14 @@ export function App() {
         playbackSupported={speech.supported}
         playbackNotice={speech.notice}
         onToggleSpeech={speech.toggle}
+        onReadMessage={readMessage}
         title={active?.title ?? "新会话"}
         messages={messages}
         value={input}
         selectedImages={selectedImages}
         processingImages={processingImages}
         sending={sending}
+        syncing={syncing}
         listening={listening}
         recordingReady={recordingReady}
         audioLevel={audioLevel}
@@ -605,6 +748,14 @@ export function App() {
               : "电脑拍照需要 HTTPS 或 localhost，请使用安全地址访问。",
           )
         }
+        onImagePickerUnavailable={(reason) => {
+          const message = reason?.includes("config")
+            ? "企业微信 JS-SDK 鉴权失败，请检查当前患者端域名是否已加入该自建应用的 JS-SDK 可信域名。"
+            : reason?.includes("api_unavailable")
+              ? "当前企业微信版本未开放图片接口，请升级企业微信后重试。"
+              : "企业微信图片能力暂时不可用，本次已回退设备原生方式。";
+          setError(message);
+        }}
         onSubmit={() => void submitMessage()}
         onStop={stopGeneration}
         onOpenHistory={() => setHistoryOpen(true)}
@@ -615,6 +766,16 @@ export function App() {
           });
         }}
       />
+      {pendingDeleteId && (
+        <DeleteConversationDialog
+          title={conversations.find(item => item.id === pendingDeleteId)?.title ?? "当前会话"}
+          deleting={deletingConversation}
+          onCancel={() => {
+            if (!deletingConversation) setPendingDeleteId(null);
+          }}
+          onConfirm={() => void deleteConversation()}
+        />
+      )}
     </main>
   );
 }

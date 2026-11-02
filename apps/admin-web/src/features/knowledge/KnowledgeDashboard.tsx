@@ -11,7 +11,6 @@ const RetrievalPanel = lazy(() => import("./RetrievalPanel").then(m => ({ defaul
 const VersionsPanel = lazy(() => import("./VersionsPanel").then(m => ({ default: m.VersionsPanel })));
 const PromptsPanel = lazy(() => import("../system/PromptsPanel").then(m => ({ default: m.PromptsPanel })));
 const ModelsPanel = lazy(() => import("../system/ModelsPanel").then(m => ({ default: m.ModelsPanel })));
-const SpeechPanel = lazy(() => import("../system/SpeechPanel").then(m => ({ default: m.SpeechPanel })));
 
 const subtitles: Record<AdminSection, string> = {
   overview: "服务状态与当前检索配置",
@@ -19,14 +18,13 @@ const subtitles: Record<AdminSection, string> = {
   chunks: "知识内容查看、编辑与删除",
   tests: "单条检索验证与批量效果评测",
   prompts: "系统与业务提示词的版本发布",
-  speech: "患者端默认播报与音色参数",
   operations: "后台任务、评测报告与审计记录",
 };
 
 export function KnowledgeDashboard({ token, section }: { token: string; section: AdminSection }) {
   const [revision, setRevision] = useState(0);
   const [selected, setSelected] = useState("");
-  const usesKnowledgeData = !["prompts", "speech"].includes(section);
+  const usesKnowledgeData = section !== "prompts";
   const overview = useAdminData<Overview>(token, usesKnowledgeData ? "/overview" : null, revision);
   const releases = useAdminData<Release[]>(token, usesKnowledgeData ? "/releases" : null, revision);
   const release = releases.data?.find(r => r.id === selected)
@@ -55,6 +53,7 @@ export function KnowledgeDashboard({ token, section }: { token: string; section:
           <div><dt>分块方式</dt><dd>{overview.data.chunk_strategy}</dd></div>
           <div><dt>向量存储</dt><dd>{overview.data.vector_storage}</dd></div>
           <div><dt>检索参数</dt><dd>Top K {overview.data.rag_top_k} · 最低分 {overview.data.rag_min_score} · 相对阈值 {overview.data.rag_relative_score}</dd></div>
+          <div><dt>Rerank 精排</dt><dd>{overview.data.reranker_enabled ? (overview.data.reranker_configured ? `已开启 · ${overview.data.reranker_model}` : "已开启但配置不完整") : "未开启"}</dd></div>
         </dl>
       </section>
     </>}
@@ -65,11 +64,11 @@ export function KnowledgeDashboard({ token, section }: { token: string; section:
     </div>}
     <Suspense fallback={<Spin />}>
     {section === "versions" && <VersionsPanel token={token} releases={releases.data ?? []}
-      release={release} onChanged={refresh} embeddingConfigured={overview.data?.embedding_configured ?? false} />}
+      release={release} onChanged={refresh} embeddingConfigured={overview.data?.embedding_configured ?? false}
+      draftLimit={overview.data?.knowledge_draft_limit ?? 5} draftCount={overview.data?.knowledge_draft_count ?? 0} />}
     {section === "chunks" && (release ? <EntriesPanel key={`${release.id}-${revision}`} token={token} release={release} onChanged={refresh} /> : <Empty description="请先创建知识版本" />)}
     {section === "tests" && (release ? <RetrievalPanel key={release.id} token={token} release={release} overview={overview.data} /> : <Empty description="请先创建知识版本" />)}
     {section === "prompts" && <PromptsPanel token={token} />}
-    {section === "speech" && <SpeechPanel token={token} />}
     {section === "operations" && <OperationsPanel token={token} revision={revision} />}
     </Suspense>
   </div>;

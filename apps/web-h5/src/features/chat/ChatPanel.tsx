@@ -1,15 +1,14 @@
 import {
   AlertCircle,
   Camera,
-  ImageOff,
   ImagePlus,
   Keyboard,
   LoaderCircle,
   Menu,
   Mic,
+  Sparkles,
   SquarePen,
   Send,
-  Sparkles,
   Square,
   Volume2,
   VolumeX,
@@ -24,14 +23,13 @@ import {
   useRef,
   useState,
 } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 
-import { api } from "../../lib/api";
-import { patientVisibleMarkdown } from "../../lib/markdown";
-import type { MediaAttachment, Message, SelectedImage } from "../../lib/types";
+import type { Message, SelectedImage } from "../../lib/types";
+import { chooseEnterpriseWeChatImages, isEnterpriseWeChat } from "../../lib/wecomImagePicker";
 import { CameraCapture } from "./CameraCapture";
+import { MobileMediaPicker } from "./MobileMediaPicker";
 import { VoiceActivity } from "./VoiceActivity";
+import { MessageBubble } from "./MessageBubble";
 
 interface ChatPanelProps {
   onCreateConversation: () => void;
@@ -40,12 +38,14 @@ interface ChatPanelProps {
   playbackSupported: boolean;
   playbackNotice: string;
   onToggleSpeech: () => void;
+  onReadMessage: (content: string) => void;
   title: string;
   messages: Message[];
   value: string;
   selectedImages: SelectedImage[];
   processingImages: boolean;
   sending: boolean;
+  syncing: boolean;
   listening: boolean;
   recordingReady: boolean;
   audioLevel: number;
@@ -60,67 +60,30 @@ interface ChatPanelProps {
   onCancelRecording: () => void;
   onRecordingUnavailable: () => void;
   onCameraUnavailable: () => void;
+  onImagePickerUnavailable: (reason?: string) => void;
   onSubmit: () => void;
   onStop: () => void;
   onOpenHistory: () => void;
   onSuggestion: (value: string) => void;
 }
 
+interface DirectFilePickerWindow extends Window {
+  showOpenFilePicker?: (options: {
+    multiple?: boolean;
+    types?: Array<{ description: string; accept: Record<string, string[]> }>;
+  }) => Promise<Array<{ getFile: () => Promise<File> }>>;
+}
+
+function directFilePicker(): DirectFilePickerWindow["showOpenFilePicker"] {
+  if (!window.isSecureContext) return undefined;
+  return (window as DirectFilePickerWindow).showOpenFilePicker;
+}
+
 const suggestions = [
-  "在进行耳部功能锻炼时，需要注意什么？",
-  "出院后必须要用纱布盖住耳朵吗？",
-  "单侧小耳畸形是否影响听力，需要定期进行听力检查吗？",
+  { title: "术后活动", question: "在进行耳部功能锻炼时，需要注意什么？" },
+  { title: "出院护理", question: "出院后必须要用纱布盖住耳朵吗？" },
+  { title: "听力检查", question: "单侧小耳畸形是否影响听力，需要定期进行听力检查吗？" },
 ];
-
-function SecureMessageImage({ attachment, index }: { attachment: MediaAttachment; index: number }) {
-  const [source, setSource] = useState<string | null>(null);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    let active = true;
-    let objectUrl: string | null = null;
-    void api
-      .mediaBlob(attachment.id)
-      .then((blob) => {
-        if (!active) return;
-        objectUrl = URL.createObjectURL(blob);
-        setSource(objectUrl);
-      })
-      .catch(() => {
-        if (active) setFailed(true);
-      });
-    return () => {
-      active = false;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [attachment.id]);
-
-  if (failed) {
-    return (
-      <div className="message-image-failed" title="图片加载失败">
-        <ImageOff size={19} />
-      </div>
-    );
-  }
-  if (!source) return <div className="message-image-loading" aria-label="图片加载中" />;
-  return (
-    <a href={source} target="_blank" rel="noreferrer" title="查看原图">
-      <img src={source} alt={`用户上传的第 ${index + 1} 张图片`} />
-    </a>
-  );
-}
-
-function MessageAttachments({ attachments }: { attachments: MediaAttachment[] }) {
-  const images = attachments.filter((item) => item.kind === "image");
-  if (!images.length) return null;
-  return (
-    <div className={`message-images count-${Math.min(images.length, 4)}`}>
-      {images.map((attachment, index) => (
-        <SecureMessageImage key={attachment.id} attachment={attachment} index={index} />
-      ))}
-    </div>
-  );
-}
 
 export function ChatPanel({
   onCreateConversation,
@@ -129,12 +92,14 @@ export function ChatPanel({
   playbackSupported,
   playbackNotice,
   onToggleSpeech,
+  onReadMessage,
   title,
   messages,
   value,
   selectedImages,
   processingImages,
   sending,
+  syncing,
   listening,
   recordingReady,
   audioLevel,
@@ -149,6 +114,7 @@ export function ChatPanel({
   onCancelRecording,
   onRecordingUnavailable,
   onCameraUnavailable,
+  onImagePickerUnavailable,
   onSubmit,
   onStop,
   onOpenHistory,
@@ -156,23 +122,29 @@ export function ChatPanel({
 }: ChatPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputId = useId();
+  const galleryInputRef = useRef<HTMLInputElement>(null);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const shouldStickToBottom = useRef(true);
+  const touchScrollStartY = useRef<number | null>(null);
   const holdStartY = useRef<number | null>(null);
   const cancelGesture = useRef(false);
   const [cameraOpen, setCameraOpen] = useState(false);
+  const [mediaPickerOpen, setMediaPickerOpen] = useState(false);
   const [voiceMode, setVoiceMode] = useState(false);
   const [showCancelHint, setShowCancelHint] = useState(false);
   const [composerExpanded, setComposerExpanded] = useState(false);
 
   useEffect(() => {
-    if (!shouldStickToBottom.current) return;
     const frame = requestAnimationFrame(() => {
+      if (!shouldStickToBottom.current) return;
       const element = scrollRef.current;
-      if (element) element.scrollTop = element.scrollHeight;
+      if (!element) return;
+      const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+      if (distance > 1) element.scrollTop = element.scrollHeight;
     });
     return () => cancelAnimationFrame(frame);
-  }, [messages, sending, selectedImages]);
+  }, [messages, selectedImages, syncing]);
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -211,8 +183,69 @@ export function ChatPanel({
     setCameraOpen(true);
   }
 
+  function openMediaPicker() {
+    const mobile = window.matchMedia("(max-width: 720px), (pointer: coarse)").matches;
+    if (mobile && (isEnterpriseWeChat() || directFilePicker())) setMediaPickerOpen(true);
+    else if (mobile) galleryInputRef.current?.click();
+    else galleryInputRef.current?.click();
+  }
+
+  async function chooseCamera() {
+    setMediaPickerOpen(false);
+    if (isEnterpriseWeChat()) {
+      try {
+        const files = await chooseEnterpriseWeChatImages(Math.max(1, 4 - selectedImages.length), "camera");
+        if (files.length) void onSelectImages(files);
+        return;
+      } catch (error) {
+        console.warn("wecom_camera_unavailable", error);
+        onImagePickerUnavailable(error instanceof Error ? error.message : String(error));
+      }
+    }
+    cameraInputRef.current?.click();
+  }
+
+  async function chooseGallery() {
+    setMediaPickerOpen(false);
+    if (isEnterpriseWeChat()) {
+      try {
+        const files = await chooseEnterpriseWeChatImages(Math.max(1, 4 - selectedImages.length), "album");
+        if (files.length) void onSelectImages(files);
+        return;
+      } catch (error) {
+        console.warn("wecom_gallery_unavailable", error);
+        onImagePickerUnavailable(error instanceof Error ? error.message : String(error));
+        galleryInputRef.current?.click();
+        return;
+      }
+    }
+    const picker = directFilePicker();
+    if (picker) {
+      try {
+        const handles = await picker({
+          multiple: true,
+          types: [{
+            description: "图片",
+            accept: {
+              "image/jpeg": [".jpg", ".jpeg"],
+              "image/png": [".png"],
+              "image/webp": [".webp"],
+              "image/heic": [".heic", ".heif"],
+            },
+          }],
+        });
+        const files = await Promise.all(handles.map((handle) => handle.getFile()));
+        if (files.length) void onSelectImages(files.slice(0, Math.max(0, 4 - selectedImages.length)));
+        return;
+      } catch (pickerError) {
+        if (pickerError instanceof DOMException && pickerError.name === "AbortError") return;
+      }
+    }
+    galleryInputRef.current?.click();
+  }
+
   function beginHold(event?: PointerEvent<HTMLButtonElement> | KeyboardEvent<HTMLButtonElement>) {
-    if (sending || listening || transcribing) return;
+    if (sending || syncing || listening || transcribing) return;
     if (!speechSupported) {
       onRecordingUnavailable();
       return;
@@ -277,23 +310,8 @@ export function ChatPanel({
 
         <div
           className="chat-heading"
-          style={{
-            flex: 1,
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-          }}
         >
-          <strong style={{
-            width: "100%",
-            maxWidth: "min(90%, 420px)",
-            whiteSpace: "nowrap",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            textAlign: "center"
-          }}>
-            {title}
-          </strong>
+          <strong>{title}</strong>
           <span>内容仅供健康科普</span>
         </div>
 
@@ -314,31 +332,49 @@ export function ChatPanel({
           shouldStickToBottom.current =
             element.scrollHeight - element.scrollTop - element.clientHeight < 96;
         }}
+        onWheel={(event) => {
+          if (event.deltaY < 0) shouldStickToBottom.current = false;
+        }}
+        onTouchStart={(event) => {
+          touchScrollStartY.current = event.touches[0]?.clientY ?? null;
+        }}
+        onTouchMove={(event) => {
+          const currentY = event.touches[0]?.clientY;
+          if (currentY !== undefined && touchScrollStartY.current !== null
+            && currentY - touchScrollStartY.current > 5) {
+            shouldStickToBottom.current = false;
+          }
+        }}
+        onTouchEnd={() => { touchScrollStartY.current = null; }}
       >
         {messages.length === 0 ? (
           <div className="welcome-block">
-            <div className="assistant-avatar" aria-hidden="true">
-              <Sparkles size={24} />
+            <div className="welcome-identity">
+              <div className="assistant-avatar" aria-hidden="true">
+                <Sparkles size={21} />
+              </div>
+              <div className="welcome-name-row">
+                <h1>耳畸形科普助手</h1>
+                <span className="beta-badge">Beta 测试版</span>
+              </div>
             </div>
-            <h1>您好，我是耳畸形科普助手(Beta)</h1>
-            <p>可以询问耳畸形相关的一般知识、就诊准备与护理常识。</p>
+            <div className="welcome-intro">
+              <strong>您好！</strong>
+              <span>可以询问耳畸形相关的一般知识、就诊准备与日常护理。</span>
+            </div>
+            <div className="suggestion-heading">常见问题</div>
             <div className="suggestion-list">
               {suggestions.map((suggestion) => (
                 <button
-                  key={suggestion}
+                  key={suggestion.question}
                   type="button"
-                  style={{
-                    display: "inline-flex",
-                    justifyContent: "center",
-                    alignItems: "center",
-                    textAlign: "center"
-                  }}
                   onClick={() => {
                     setVoiceMode(false);
-                    onSuggestion(suggestion);
+                    onSuggestion(suggestion.question);
                   }}
                 >
-                  {suggestion}
+                  <strong>{suggestion.title}</strong>
+                  <span>{suggestion.question}</span>
                 </button>
               ))}
             </div>
@@ -346,40 +382,19 @@ export function ChatPanel({
         ) : (
           <div className="messages">
             {messages.map((message) => (
-              <article className={`message-row ${message.role}`} key={message.id}>
-                <div
-                  className={`message-content ${
-                    (message.attachments?.length ?? 0) > 0 ? "has-attachments" : ""
-                  }`}
-                >
-                  {message.status === "streaming" && !message.content ? (
-                    <div className="typing" aria-label="正在生成回答">
-                      <i />
-                      <i />
-                      <i />
-                    </div>
-                  ) : message.role === "assistant" ? (
-                    <div
-                      className={`message-body ${
-                        message.status === "streaming" ? "is-streaming" : ""
-                      }`}
-                    >
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                        {patientVisibleMarkdown(message.content)}
-                      </ReactMarkdown>
-                    </div>
-                  ) : (
-                    <div className="user-message-bubble">
-                      <MessageAttachments attachments={message.attachments ?? []} />
-                      <p>{message.content}</p>
-                    </div>
-                  )}
-                  {message.status === "interrupted" && (
-                    <small className="message-status">回答已中断</small>
-                  )}
-                </div>
-              </article>
+              <MessageBubble key={`${message.conversation_id}:${message.sequence_no}`} message={message}
+                animate={message.id.startsWith("local-") || message.status === "streaming"}
+                onRead={onReadMessage} />
             ))}
+            {syncing && (
+              <div className="conversation-sync" role="status" aria-live="polite">
+                <LoaderCircle className="spin" size={18} />
+                <div>
+                  <strong>正在同步上一条回答</strong>
+                  <span>可以先输入，完成后再发送</span>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -419,7 +434,8 @@ export function ChatPanel({
             } ${!voiceMode && composerExpanded ? "is-expanded" : ""}`}
           >
             <input
-              id={`${inputId}-images`}
+              ref={galleryInputRef}
+              id={`${inputId}-gallery`}
               className="visually-hidden image-input"
               type="file"
               accept="image/*,.heic,.heif"
@@ -432,8 +448,24 @@ export function ChatPanel({
               }}
               disabled={sending || listening || transcribing || processingImages}
             />
+            <input
+              ref={cameraInputRef}
+              id={`${inputId}-camera`}
+              className="visually-hidden image-input"
+              type="file"
+              accept="image/*"
+              capture="environment"
+              aria-hidden="true"
+              tabIndex={-1}
+              onChange={(event) => {
+                if (event.currentTarget.files) void onSelectImages(event.currentTarget.files);
+                event.currentTarget.value = "";
+              }}
+              disabled={sending || listening || transcribing || processingImages}
+            />
             <div className="media-picker">
-              <label
+              <button
+                type="button"
                 className={`composer-tool-button ${
                   sending ||
                   listening ||
@@ -443,39 +475,18 @@ export function ChatPanel({
                     ? "is-disabled"
                     : ""
                 }`}
-                htmlFor={`${inputId}-images`}
-                role="button"
-                tabIndex={
-                  sending ||
-                  listening ||
-                  transcribing ||
-                  processingImages ||
-                  selectedImages.length >= 4
-                    ? -1
-                    : 0
-                }
+                onClick={openMediaPicker}
+                disabled={sending || listening || transcribing || processingImages || selectedImages.length >= 4}
                 title={processingImages ? "正在处理图片" : "添加图片"}
                 aria-label="添加图片"
-                aria-disabled={
-                  sending ||
-                  listening ||
-                  transcribing ||
-                  processingImages ||
-                  selectedImages.length >= 4
-                }
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    document.getElementById(`${inputId}-images`)?.click();
-                  }
-                }}
               >
                 {processingImages ? (
                   <LoaderCircle className="spin" size={19} />
                 ) : (
                   <ImagePlus size={19} />
                 )}
-              </label>
+                {selectedImages.length > 0 && <span className="media-count" aria-hidden="true">{selectedImages.length}</span>}
+              </button>
             </div>
             <button
               className="composer-tool-button desktop-camera-button"
@@ -516,23 +527,23 @@ export function ChatPanel({
                     endHold();
                   }
                 }}
-                disabled={sending || transcribing}
+                disabled={sending || syncing || transcribing}
                 aria-label="按住说话，松开发送"
               >
                 {transcribing ? (
                   <>
-                    <LoaderCircle className="spin" size={18} />
-                    识别中
+                    <span className="hold-to-talk-icon"><LoaderCircle className="spin" size={17} /></span>
+                    <span>识别中</span>
                   </>
                 ) : listening ? (
                   <>
-                    <span className="recording-dot" aria-hidden="true" />
-                    {showCancelHint ? "松开取消" : recordingReady ? "松开发送" : "开启麦克风中"}
+                    <span className="hold-to-talk-icon"><span className="recording-dot" aria-hidden="true" /></span>
+                    <span>{showCancelHint ? "松开取消" : recordingReady ? "松开发送" : "开启麦克风中"}</span>
                   </>
                 ) : (
                   <>
-                    <Mic size={18} />
-                    {sending ? "正在回答" : "按住说话"}
+                    <span className="hold-to-talk-icon"><Mic size={17} /></span>
+                    <span>{syncing ? "同步回答中" : sending ? "正在回答" : "按住说话"}</span>
                   </>
                 )}
               </button>
@@ -547,7 +558,7 @@ export function ChatPanel({
                     onSubmit();
                   }
                 }}
-                placeholder={sending ? "回答生成中，可随时停止" : "输入问题，或添加图片"}
+                placeholder={syncing ? "正在同步上一条回答" : sending ? "回答生成中，可随时停止" : "输入问题，或添加图片"}
                 aria-label="咨询问题"
                 rows={1}
                 maxLength={4000}
@@ -594,6 +605,7 @@ export function ChatPanel({
                 type="submit"
                 disabled={
                   transcribing ||
+                  syncing ||
                   processingImages ||
                   voiceMode ||
                   (value.trim().length === 0 && selectedImages.length === 0)
@@ -614,6 +626,13 @@ export function ChatPanel({
           onClose={() => setCameraOpen(false)}
         />
       )}
+      <MobileMediaPicker
+        open={mediaPickerOpen}
+        remaining={Math.max(0, 4 - selectedImages.length)}
+        onCamera={() => void chooseCamera()}
+        onGallery={() => void chooseGallery()}
+        onClose={() => setMediaPickerOpen(false)}
+      />
     </section>
   );
 }

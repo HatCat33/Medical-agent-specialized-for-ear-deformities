@@ -32,8 +32,9 @@ try {
       window.__audioEvents = [];
       const originalPlay = HTMLMediaElement.prototype.play;
       HTMLMediaElement.prototype.play = function () {
-        this.addEventListener("playing", () => window.__audioEvents.push({ kind: "playing", time: performance.now() }), { once: true });
-        this.addEventListener("ended", () => window.__audioEvents.push({ kind: "ended", time: performance.now() }), { once: true });
+        const source = this.currentSrc || this.src;
+        this.addEventListener("playing", () => window.__audioEvents.push({ kind: "playing", source, time: performance.now() }), { once: true });
+        this.addEventListener("ended", () => window.__audioEvents.push({ kind: "ended", source, time: performance.now() }), { once: true });
         return originalPlay.call(this);
       };
     });
@@ -57,11 +58,16 @@ try {
     await page.locator("textarea").fill("测试连续播报");
     const send = page.getByRole("button", { name: "发送问题", exact: true });
     if (mobile) await send.tap(); else await send.click();
-    await page.waitForFunction(() => window.__audioEvents.some(e => e.kind === "playing"));
+    await page.locator(".message-row.assistant .message-body").waitFor();
+    await page.waitForTimeout(220);
+    const progressiveLength = (await page.locator(".message-row.assistant .message-body").innerText()).length;
+    expect(progressiveLength).toBeGreaterThan(0);
+    expect(progressiveLength).toBeLessThan(answer.length / 2);
+    await page.waitForFunction(() => window.__audioEvents.some(e => e.kind === "playing" && !e.source.startsWith("data:")));
     expect(requests.length).toBeGreaterThanOrEqual(2);
-    expect(await page.evaluate(() => window.__audioEvents.filter(e => e.kind === "ended").length)).toBe(0);
-    await page.waitForFunction(() => window.__audioEvents.filter(e => e.kind === "playing").length >= 2);
-    const events = await page.evaluate(() => window.__audioEvents);
+    expect(await page.evaluate(() => window.__audioEvents.filter(e => e.kind === "ended" && !e.source.startsWith("data:")).length)).toBe(0);
+    await page.waitForFunction(() => window.__audioEvents.filter(e => e.kind === "playing" && !e.source.startsWith("data:")).length >= 2);
+    const events = await page.evaluate(() => window.__audioEvents.filter(e => !e.source.startsWith("data:")));
     const firstEnd = events.find(e => e.kind === "ended");
     const secondStart = events.filter(e => e.kind === "playing")[1];
     expect(firstEnd).toBeTruthy();
@@ -79,7 +85,7 @@ try {
       expect(await page.evaluate(() => getComputedStyle(document.activeElement).outlineStyle)).toBe("solid");
     }
     await expect(page.getByRole("button", { name: "开启自动播报", exact: true })).toBeVisible();
-    expect(requests.every(text => text.length <= 320)).toBe(true);
+    expect(requests.every(text => text.length <= 64)).toBe(true);
     expect(errors).toEqual([]);
     await page.screenshot({ path: `.artifacts/visual-check/${mobile ? "mobile" : "desktop"}-continuous-speech.png` });
     console.log(`${mobile ? "mobile" : "desktop"}: prefetched ${requests.length} segments; native audio gap ${Math.round(secondStart.time - firstEnd.time)} ms; focus and touch feedback passed.`);

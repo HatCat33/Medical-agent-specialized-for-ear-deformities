@@ -10,6 +10,7 @@ from medical_agent.core.logging import configure_logging
 from medical_agent.core.middleware import RequestContextMiddleware
 from medical_agent.modules.channels.wechat_kf.service import runtime as wechat_kf_runtime
 from medical_agent.modules.channels.wecom.service import runtime as wecom_runtime
+from medical_agent.modules.speech.synthesis import close_synthesis_clients
 
 
 @asynccontextmanager
@@ -21,14 +22,20 @@ async def lifespan(_: FastAPI):
 
     from medical_agent.core.database import session_factory
     from medical_agent.modules.knowledge.models import KnowledgeOperation
+    from medical_agent.modules.system.model_config_service import load_runtime_model_configuration
 
     async with session_factory() as db:
+        await load_runtime_model_configuration(db)
         await db.execute(
             update(KnowledgeOperation)
             .where(KnowledgeOperation.active_slot.is_not(None))
             .values(status="interrupted", active_slot=None, error="server_restarted_retry_required")
         )
         await db.commit()
+    if get_settings().tts_protocol == "local-sherpa":
+        from medical_agent.modules.speech.local_tts import warm_local_tts
+
+        await warm_local_tts(get_settings())
     await wecom_runtime.start(get_settings())
     await wechat_kf_runtime.start(get_settings())
     try:
@@ -36,6 +43,7 @@ async def lifespan(_: FastAPI):
     finally:
         await wechat_kf_runtime.stop()
         await wecom_runtime.stop()
+        await close_synthesis_clients()
         await close_db()
 
 

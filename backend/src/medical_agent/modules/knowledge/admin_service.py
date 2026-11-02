@@ -127,7 +127,18 @@ def entry_view(entry: KnowledgeEntry) -> dict[str, Any]:
     }
 
 
-async def create_draft(db: AsyncSession, name: str, base_id: str | None) -> KnowledgeRelease:
+async def create_draft(
+    db: AsyncSession,
+    name: str,
+    base_id: str | None,
+    *,
+    draft_limit: int,
+) -> KnowledgeRelease:
+    draft_count = await db.scalar(
+        select(func.count()).select_from(KnowledgeRelease).where(KnowledgeRelease.status == "draft")
+    )
+    if (draft_count or 0) >= draft_limit:
+        raise HTTPException(409, "knowledge_draft_limit_reached")
     if base_id:
         await require_release(db, base_id, idle=True)
     base = await repository.get_release_by_id(db, release_id=base_id) if base_id else None

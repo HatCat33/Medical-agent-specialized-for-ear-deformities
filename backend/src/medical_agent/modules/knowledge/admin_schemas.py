@@ -52,3 +52,12 @@ class EvaluationCaseGenerateRequest(BaseModel):
     release_id: str
     limit: int = Field(default=50, ge=1, le=100)
     source: Literal["mixed", "aliases", "standard"] = "standard"
+
+
+class ConversationTestTurn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class ConversationTestRequest(BaseModel):
+    turns: list[ConversationTestTurn] = Field(min_length=2, max_length=20)

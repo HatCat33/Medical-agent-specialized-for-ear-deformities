@@ -18,7 +18,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from medical_agent.core.config import Settings
-from medical_agent.modules.speech.synthesis import effective_voice, is_configured, synthesize
+from medical_agent.modules.speech.synthesis import (
+    effective_model,
+    effective_voice,
+    is_configured,
+    open_synthesis_stream,
+    synthesize,
+)
 from medical_agent.modules.system.models import AdminOperation
 from medical_agent.modules.system.probe_diagnostics import failure_detail, safe_host
 from medical_agent.modules.system.schemas import SpeechSettings
@@ -33,9 +39,17 @@ from medical_agent.providers.llm.client import (
     ProviderError,
 )
 from medical_agent.providers.llm.protocol import ChatTurn, ImageInput
+from medical_agent.providers.rerank.client import (
+    RerankerProviderError,
+    build_reranker_provider,
+)
 
-ModelKind = Literal["chat", "vision", "asr", "embedding", "tts", "browser_tts"]
-MODEL_KINDS: tuple[ModelKind, ...] = ("chat", "vision", "asr", "embedding", "tts", "browser_tts")
+ModelKind = Literal[
+    "chat", "chat_fallback", "vision", "asr", "embedding", "reranker", "tts", "browser_tts"
+]
+MODEL_KINDS: tuple[ModelKind, ...] = (
+    "chat", "chat_fallback", "vision", "asr", "embedding", "reranker", "tts", "browser_tts"
+)
 
 
 def _probe_png() -> bytes:
@@ -84,6 +98,25 @@ def _cards(settings: Settings) -> list[dict[str, Any]]:
                 "timeout_seconds": settings.llm_timeout_seconds,
                 "max_tokens": settings.llm_max_tokens,
                 "thinking": settings.llm_enable_thinking,
+                "retry_count": settings.llm_retry_count,
+            },
+        },
+        {
+            "kind": "chat_fallback",
+            "label": "备用对话",
+            "provider": "openai-compatible" if settings.fallback_llm_model else "disabled",
+            "model": settings.fallback_llm_model,
+            "endpoint_host": _host(settings.fallback_llm_base_url),
+            "api_key_configured": bool(settings.fallback_llm_api_key),
+            "configured": _configured(
+                settings.fallback_llm_base_url,
+                settings.fallback_llm_api_key,
+                settings.fallback_llm_model,
+            ),
+            "settings": {
+                "timeout_seconds": settings.fallback_llm_timeout_seconds,
+                "max_tokens": settings.fallback_llm_max_tokens,
+                "thinking": settings.fallback_llm_enable_thinking,
             },
         },
         {
@@ -134,12 +167,30 @@ def _cards(settings: Settings) -> list[dict[str, Any]]:
             },
         },
         {
+            "kind": "reranker",
+            "label": "结果精排",
+            "provider": "compatible" if settings.reranker_model else "disabled",
+            "model": settings.reranker_model,
+            "endpoint_host": _host(settings.reranker_base_url),
+            "api_key_configured": bool(settings.reranker_api_key),
+            "configured": settings.reranker_enabled and _configured(
+                settings.reranker_base_url,
+                settings.reranker_api_key,
+                settings.reranker_model,
+            ),
+            "settings": {
+                "enabled": settings.reranker_enabled,
+                "timeout_seconds": settings.reranker_timeout_seconds,
+                "candidate_k": settings.reranker_candidate_k,
+            },
+        },
+        {
             "kind": "tts",
             "label": "云端语音合成",
-            "provider": "openai-compatible",
-            "model": settings.tts_model,
-            "endpoint_host": _host(settings.tts_base_url),
-            "api_key_configured": bool(settings.tts_api_key),
+            "provider": settings.tts_protocol,
+            "model": effective_model(settings),
+            "endpoint_host": "本机 CPU" if settings.tts_protocol == "local-sherpa" else _host(settings.tts_base_url),
+            "api_key_configured": settings.tts_protocol != "local-sherpa" and bool(settings.tts_api_key),
             "configured": is_configured(settings),
             "client_only": False,
             "settings": {},
@@ -181,6 +232,10 @@ async def model_inventory(db: AsyncSession, settings: Settings) -> dict[str, Any
             "voice": effective_voice(speech, settings),
             "rate": speech.rate,
             "timeout_seconds": settings.tts_timeout_seconds,
+            "streaming_enabled": settings.tts_streaming_enabled,
+            "stream_sample_rate": settings.tts_stream_sample_rate,
+            "stream_channels": settings.tts_stream_channels,
+            "local_threads": settings.tts_local_threads,
         },
         active=speech.provider == "openai-compatible",
     )
@@ -247,6 +302,31 @@ async def _probe_vision(settings: Settings) -> dict[str, object]:
     return {"response_received": bool(result.strip()), "test_image": "64x64_png"}
 
 
+async def _probe_chat_fallback(settings: Settings) -> dict[str, object]:
+    if not _configured(
+        settings.fallback_llm_base_url,
+        settings.fallback_llm_api_key,
+        settings.fallback_llm_model,
+    ):
+        raise RuntimeError("model_not_configured")
+    provider = OpenAICompatibleProvider(
+        settings.model_copy(
+            update={
+                "llm_base_url": settings.fallback_llm_base_url,
+                "llm_api_key": settings.fallback_llm_api_key,
+                "llm_model": settings.fallback_llm_model,
+                "llm_timeout_seconds": min(settings.fallback_llm_timeout_seconds, 15.0),
+                "llm_max_tokens": 128,
+                "llm_enable_thinking": settings.fallback_llm_enable_thinking,
+            }
+        )
+    )
+    result = await provider.complete(
+        [ChatTurn(role="system", content="这是服务探活。"), ChatTurn(role="user", content="只回复 OK")]
+    )
+    return {"response_received": bool(result.strip())}
+
+
 async def _probe_embedding(settings: Settings) -> dict[str, object]:
     provider = build_embedding_provider(settings)
     if provider is None:
@@ -255,6 +335,20 @@ async def _probe_embedding(settings: Settings) -> dict[str, object]:
     if not vectors or not vectors[0] or any(not math.isfinite(value) for value in vectors[0]):
         raise EmbeddingProviderError("embedding_response_invalid")
     return {"dimension": len(vectors[0])}
+
+
+async def _probe_reranker(settings: Settings) -> dict[str, object]:
+    provider = build_reranker_provider(settings)
+    if provider is None:
+        raise RuntimeError("model_not_configured")
+    rows = await provider.rerank(
+        query="耳廓护理",
+        documents=["耳廓日常护理注意事项", "无关测试内容"],
+        top_n=1,
+    )
+    if not rows:
+        raise RerankerProviderError("reranker_response_invalid")
+    return {"response_received": True, "top_score": rows[0].score}
 
 
 def _silent_wav() -> bytes:
@@ -296,10 +390,14 @@ async def _execute_probe(kind: ModelKind, settings: Settings) -> dict[str, objec
     async with asyncio.timeout(16):
         if kind == "chat":
             return await _probe_chat(settings)
+        if kind == "chat_fallback":
+            return await _probe_chat_fallback(settings)
         if kind == "vision":
             return await _probe_vision(settings)
         if kind == "asr":
             return await _probe_asr(settings)
+        if kind == "reranker":
+            return await _probe_reranker(settings)
         return await _probe_embedding(settings)
 
 
@@ -310,7 +408,10 @@ def _safe_error(exc: Exception) -> str:
         return f"upstream_http_{exc.response.status_code}"
     if isinstance(exc, TimeoutError):
         return "probe_timeout"
-    if isinstance(exc, (ProviderError, EmbeddingProviderError, RuntimeError, TypeError)):
+    if isinstance(
+        exc,
+        (ProviderError, EmbeddingProviderError, RerankerProviderError, RuntimeError, TypeError),
+    ):
         value = str(exc)
         allowed = {
             "model_not_configured",
@@ -320,6 +421,8 @@ def _safe_error(exc: Exception) -> str:
             "embedding_request_failed",
             "embedding_response_invalid",
             "embedding_count_mismatch",
+            "reranker_request_failed",
+            "reranker_response_invalid",
             "asr_response_invalid",
         }
         return value if value in allowed else "probe_failed"
@@ -342,9 +445,28 @@ async def probe_model(
         speech = (speech_override or await read_settings(db)) if kind == "tts" else None
         if speech is not None:
             async with asyncio.timeout(settings.tts_timeout_seconds):
-                audio = await synthesize("语音服务测试。", speech, settings)
+                if settings.tts_streaming_enabled:
+                    stream = await open_synthesis_stream("语音服务测试。", speech, settings)
+                    audio_bytes = 0
+                    first_audio_ms: float | None = None
+                    async for block in stream.iter_bytes():
+                        if first_audio_ms is None:
+                            first_audio_ms = round((time.perf_counter() - started) * 1000, 2)
+                        audio_bytes += len(block)
+                    detail = {
+                        "response_received": True,
+                        "audio_bytes": audio_bytes,
+                        "first_audio_ms": first_audio_ms,
+                        "streaming": True,
+                    }
+                else:
+                    audio = await synthesize("语音服务测试。", speech, settings)
+                    detail = {
+                        "response_received": True,
+                        "audio_bytes": len(audio),
+                        "streaming": False,
+                    }
             status = "healthy"
-            detail = {"response_received": True, "audio_bytes": len(audio)}
         else:
             detail = await _execute_probe(kind, settings)
     except Exception as exc:  # noqa: BLE001 - provider failures must become sanitized probe results.
@@ -356,7 +478,7 @@ async def probe_model(
     if kind == "tts":
         preferences = speech_override or await read_settings(db)
         detail.update(
-            model=settings.tts_model,
+            model=effective_model(settings),
             voice=effective_voice(preferences, settings),
             configuration="试听表单" if speech_override else "已保存设置",
         )

@@ -1,9 +1,9 @@
 """Conversation API contracts."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from medical_agent.modules.media.schemas import MediaRead
 
@@ -22,6 +22,14 @@ class ConversationRead(BaseModel):
     updated_at: datetime
     last_message_at: datetime | None
 
+    @field_serializer("created_at", "updated_at", "last_message_at")
+    def serialize_utc(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
 
 class MessageRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -36,9 +44,16 @@ class MessageRead(BaseModel):
     created_at: datetime
     attachments: list[MediaRead] = Field(default_factory=lambda: list[MediaRead]())
 
+    @field_serializer("created_at")
+    def serialize_utc(self, value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
 
 class ConversationDetail(ConversationRead):
     messages: list[MessageRead]
+    generation_pending: bool = False
 
 
 class SendMessageRequest(BaseModel):

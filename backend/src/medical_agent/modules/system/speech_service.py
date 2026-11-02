@@ -22,7 +22,7 @@ async def save_settings(db: AsyncSession, payload: SpeechSettings) -> SpeechSett
         settings = get_settings()
         if not is_configured(settings):
             raise HTTPException(422, "tts_not_configured")
-        if not (payload.cloud_voice or settings.tts_voice):
+        if settings.tts_protocol != "local-sherpa" and not (payload.cloud_voice or settings.tts_voice):
             raise HTTPException(422, "tts_voice_required")
     row = await db.get(RuntimeSetting, KEY)
     if row is None:

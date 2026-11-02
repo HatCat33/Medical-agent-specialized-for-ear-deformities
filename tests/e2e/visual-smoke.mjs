@@ -111,7 +111,7 @@ try {
     if (await voiceButton.isDisabled()) {
       throw new Error(`${target.name} voice mode switch is unexpectedly disabled`);
     }
-    if ((await page.locator("input.image-input").getAttribute("multiple")) === null) {
+    if ((await page.locator("input.image-input[multiple]").getAttribute("multiple")) === null) {
       throw new Error(`${target.name} unified image input does not support multiple files`);
     }
     const desktopCamera = page.getByRole("button", { name: "使用电脑摄像头拍照" });
@@ -183,18 +183,29 @@ try {
     await textarea.fill("");
     await page.locator(".composer-row.is-expanded").waitFor({ state: "detached" });
 
-    const [imageChooser] = await Promise.all([
-      page.waitForEvent("filechooser"),
-      mediaButton.click(),
-    ]);
-    if (!imageChooser.isMultiple()) {
-      throw new Error(`${target.name} unified image chooser is not multiple`);
+    if (target.name === "mobile") {
+      await mediaButton.click();
+      await page.getByRole("dialog", { name: "添加图片" }).waitFor();
+      await page.getByRole("button", { name: "关闭图片选择" }).click();
+      await page.locator("input.image-input[multiple]").setInputFiles({
+        name: "gallery-photo.png",
+        mimeType: "image/png",
+        buffer: pixelPng,
+      });
+    } else {
+      const [imageChooser] = await Promise.all([
+        page.waitForEvent("filechooser"),
+        mediaButton.click(),
+      ]);
+      if (!imageChooser.isMultiple()) {
+        throw new Error(`${target.name} unified image chooser is not multiple`);
+      }
+      await imageChooser.setFiles({
+        name: "gallery-photo.png",
+        mimeType: "image/png",
+        buffer: pixelPng,
+      });
     }
-    await imageChooser.setFiles({
-      name: "gallery-photo.png",
-      mimeType: "image/png",
-      buffer: pixelPng,
-    });
     await page.locator(".selected-image").waitFor();
     await page.locator(".selected-image button").click();
 
@@ -267,7 +278,7 @@ try {
       ) {
         throw new Error(`mobile composer controls are not aligned: ${composerCenters}`);
       }
-      await page.locator("input.image-input").setInputFiles([
+      await page.locator("input.image-input[multiple]").setInputFiles([
         { name: "visual-front.png", mimeType: "image/png", buffer: pixelPng },
         { name: "visual-side.png", mimeType: "image/png", buffer: pixelPng },
       ]);

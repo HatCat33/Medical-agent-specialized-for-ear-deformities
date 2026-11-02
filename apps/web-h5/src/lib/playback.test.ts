@@ -21,7 +21,10 @@ describe("live answer speech", () => {
     setup();
     const play = vi.fn().mockResolvedValue(undefined);
     const pause = vi.fn();
-    vi.stubGlobal("Audio", class { play = play; pause = pause; });
+    vi.stubGlobal("Audio", class {
+      src = ""; currentTime = 0; preload = ""; volume = 1;
+      play = play; pause = pause; load = vi.fn(); removeAttribute = vi.fn(); setAttribute = vi.fn();
+    });
     let resolveAudio: (blob: Blob) => void = () => undefined;
     let signal: AbortSignal | undefined;
     const synthesize = vi.fn((_text: string, requestSignal: AbortSignal) => {
@@ -32,13 +35,13 @@ describe("live answer speech", () => {
     playback.configure({ ...defaultSpeechSettings, provider: "openai-compatible", cloud_voice: "custom" });
     playback.begin(); playback.append("第一句。第二句。");
     playback.finish();
-    expect(synthesize).toHaveBeenCalledTimes(2);
+    expect(synthesize).toHaveBeenCalledTimes(1);
     playback.setEnabled(false);
     expect(signal?.aborted).toBe(true);
     resolveAudio(new Blob(["audio"]));
     await Promise.resolve(); await Promise.resolve();
-    expect(play).not.toHaveBeenCalled();
-    expect(synthesize).toHaveBeenCalledTimes(2);
+    expect(play).toHaveBeenCalledTimes(1); // Only the silent user-gesture unlock played.
+    expect(synthesize).toHaveBeenCalledTimes(1);
   });
   it("speaks completed sentences before generation ends and flushes the tail once", () => {
     const { playback, utterances } = setup();
@@ -46,12 +49,30 @@ describe("live answer speech", () => {
     playback.begin(); playback.append("第一句");
     expect(utterances).toHaveLength(0);
     playback.append("。第二句。");
-    expect(utterances.map(item => item.text)).toEqual(["第一句。第二句。"]);
+    expect(utterances.map(item => item.text)).toEqual(["第一句。"]);
     expect(utterances[0].voice?.voiceURI).toBe("zh-test");
     expect(utterances[0].rate).toBe(1.2);
     playback.append("没有标点的尾句"); playback.finish(); playback.finish();
     utterances[0].onend?.(new Event("end") as SpeechSynthesisEvent);
-    expect(utterances.map(item => item.text)).toEqual(["第一句。第二句。", "没有标点的尾句"]);
+    expect(utterances.map(item => item.text)).toEqual(["第一句。", "第二句。没有标点的尾句"]);
+  });
+
+  it("starts a long streaming sentence at a natural clause before the final period", () => {
+    const { playback, utterances } = setup();
+    playback.begin();
+    playback.append("孩子术后需要保持局部清洁干燥，并注意观察有没有红肿渗液，后续再按医生安排复诊。");
+    expect(utterances[0].text).toBe("孩子术后需要保持局部清洁干燥，");
+  });
+
+  it("starts punctuation-free streaming text after a short latency", () => {
+    vi.useFakeTimers();
+    const { playback, utterances } = setup();
+    playback.begin();
+    playback.append("这是一段暂时没有标点但已经足够开始播放的模型回答内容");
+    expect(utterances).toHaveLength(0);
+    vi.advanceTimersByTime(180);
+    expect(utterances[0].text).toBe("这是一段暂时没有标点但已经足够开始播放的模型回答内容");
+    playback.cancel();
   });
 
   it("mute cancels immediately, clears pending audio, and doesn't replay muted sentences", () => {
@@ -82,6 +103,14 @@ describe("live answer speech", () => {
     expect(utterances[0].text).toBe("现在开始出声。");
   });
 
+  it("allows an explicit message read while automatic playback is muted", () => {
+    const { playback, utterances } = setup();
+    playback.setEnabled(false);
+    playback.read("手动朗读这条消息。");
+    expect(utterances.map(item => item.text)).toEqual(["手动朗读这条消息。"]);
+    playback.cancel();
+  });
+
   it("discarding a response prevents old callbacks from advancing its queue", () => {
     const { playback, utterances } = setup();
     playback.begin(); playback.append("旧回答。旧的下一句。");
@@ -90,6 +119,24 @@ describe("live answer speech", () => {
     expect(utterances).toHaveLength(1);
     playback.begin(); playback.append("新回答。");
     expect(utterances[1].text).toBe("新回答。");
+  });
+
+  it("ignores late speech callbacks from an older conversation turn", () => {
+    const { playback, utterances } = setup();
+    playback.begin(false, "old-turn");
+    playback.append("旧回答。", "old-turn");
+
+    playback.begin(false, "new-turn");
+    playback.cancel("old-turn");
+    playback.append("不应播出的旧内容。", "old-turn");
+    playback.finish("old-turn");
+    playback.append("新会话回答。", "new-turn");
+    playback.finish("new-turn");
+
+    expect(utterances.map(item => item.text)).toEqual([
+      "旧回答。",
+      "新会话回答。",
+    ]);
   });
 
   it("falls back to a local language voice when a configured online voice does not start", () => {
@@ -101,7 +148,7 @@ describe("live answer speech", () => {
     playback.configure({ ...defaultSpeechSettings, voice: "remote-zh", language: "zh-HK" });
     playback.begin(); playback.append("需要回退的回答。");
     expect(utterances[0].voice?.voiceURI).toBe("remote-zh");
-    vi.advanceTimersByTime(4080);
+    vi.advanceTimersByTime(5080);
     expect(utterances[1].voice?.voiceURI).toBe("local-zh");
     expect(onError).not.toHaveBeenCalled();
     playback.cancel();

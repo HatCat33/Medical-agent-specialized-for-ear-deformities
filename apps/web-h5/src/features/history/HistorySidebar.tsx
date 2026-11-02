@@ -1,5 +1,4 @@
 import {
-  Clock3,
   MessageSquareText,
   PanelLeftClose,
   PanelLeftOpen,
@@ -45,6 +44,12 @@ export function HistorySidebar({
   onSelect,
   onDelete,
 }: HistorySidebarProps) {
+  const orderedConversations = [...conversations].sort((left, right) => {
+    const leftTime = new Date(left.last_message_at ?? left.created_at).getTime();
+    const rightTime = new Date(right.last_message_at ?? right.created_at).getTime();
+    return rightTime - leftTime;
+  });
+
   return (
     <aside
       className={`history-sidebar ${open ? "is-open" : ""} ${collapsed ? "is-collapsed" : ""}`}
@@ -52,8 +57,8 @@ export function HistorySidebar({
     >
       <div className="history-header">
         <div className="history-title">
-          <Clock3 size={18} />
-          <span>历史会话</span>
+          <span className="history-title-mark" aria-hidden="true"><MessageSquareText size={17} /></span>
+          <span className="history-title-copy"><strong>历史会话</strong><small>{conversations.length} 条会话</small></span>
         </div>
         <button
           className="icon-button sidebar-collapse-button desktop-only"
@@ -80,12 +85,11 @@ export function HistorySidebar({
       </button>
 
       <div className="history-body">
-        <div className="history-section-label">最近</div>
         <div className="history-list">
           {conversations.length === 0 ? (
-            <p className="history-empty">暂无历史会话</p>
+            <div className="history-empty"><MessageSquareText size={21} /><p>还没有历史会话</p><span>发出第一条问题后会保存在这里</span></div>
           ) : (
-            conversations.map((conversation) => (
+            orderedConversations.map((conversation) => (
               <div
                 className={`history-item ${conversation.id === activeId ? "is-active" : ""}`}
                 key={conversation.id}
@@ -97,9 +101,6 @@ export function HistorySidebar({
                   onClick={() => onSelect(conversation.id)}
                   title={conversation.title}
                 >
-                  <span className="history-item-icon" aria-hidden="true">
-                    <MessageSquareText size={16} />
-                  </span>
                   <span className="history-item-copy">
                     <strong>{conversation.title}</strong>
                     <small>{displayTime(conversation.last_message_at)}</small>

@@ -4,8 +4,8 @@ import { knowledgeApi, type Operation, type Release } from "../../lib/api";
 import { errorText, labels } from "./shared";
 import { ErrorNotice } from "./ErrorNotice";
 
-interface Props { token: string; release?: Release; releases: Release[]; embeddingConfigured: boolean; onChanged: (id?: string) => void }
-export function VersionsPanel({ token, release, releases, embeddingConfigured, onChanged }: Props) {
+interface Props { token: string; release?: Release; releases: Release[]; embeddingConfigured: boolean; draftLimit: number; draftCount: number; onChanged: (id?: string) => void }
+export function VersionsPanel({ token, release, releases, embeddingConfigured, draftLimit, draftCount, onChanged }: Props) {
   const [name, setName] = useState("");
   const [batch, setBatch] = useState(32);
   const [busy, setBusy] = useState(false);
@@ -46,9 +46,10 @@ export function VersionsPanel({ token, release, releases, embeddingConfigured, o
     <section className="knowledge-section">
       <h2>创建知识版本</h2><div className="toolbar">
         <Input aria-label="新版本名称" placeholder="新版本名称" maxLength={120} value={name} onChange={e => setName(e.target.value)} />
-        <Button type="primary" disabled={!release} loading={busy} onClick={() => void create(true)}>复制当前版本为草稿</Button>
-        <Button disabled={busy} onClick={() => void create(false)}>新建空白草稿</Button>
+        <Button type="primary" disabled={!release || draftCount >= draftLimit} loading={busy} onClick={() => void create(true)}>复制当前版本为草稿</Button>
+        <Button disabled={busy || draftCount >= draftLimit} onClick={() => void create(false)}>新建空白草稿</Button>
       </div>
+      <p className="muted">当前 {draftCount}/{draftLimit} 个草稿。达到上限后需先发布或删除草稿，避免版本长期堆积。</p>
     </section>
     {release && <section className="knowledge-section">
       <div className="section-heading"><h2>{release.name}</h2><Tag>{labels[release.status]}</Tag></div>

@@ -7,6 +7,7 @@ from medical_agent.modules.channels.wechat_kf.router import (
     callback_router as wechat_kf_callback_router,
 )
 from medical_agent.modules.channels.wecom.router import router as wecom_admin_router
+from medical_agent.modules.channels.wecom_h5.router import router as wecom_h5_router
 from medical_agent.modules.conversation.router import router as conversation_router
 from medical_agent.modules.knowledge.admin_router import router as knowledge_admin_router
 from medical_agent.modules.knowledge.router import router as knowledge_router
@@ -22,6 +23,7 @@ api_router.include_router(media_router)
 api_router.include_router(speech_router)
 api_router.include_router(system_admin_router)
 api_router.include_router(wecom_admin_router)
+api_router.include_router(wecom_h5_router)
 api_router.include_router(wechat_kf_callback_router)
 api_router.include_router(wechat_kf_admin_router)
 

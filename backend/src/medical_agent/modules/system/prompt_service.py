@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from medical_agent.core.logging import get_logger
@@ -73,8 +73,18 @@ async def list_prompts(db: AsyncSession) -> dict[str, Any]:
 
 
 async def create_prompt(
-    db: AsyncSession, *, name: str, content: str, system_content: str = SAFETY_SYSTEM_PROMPT
+    db: AsyncSession,
+    *,
+    name: str,
+    content: str,
+    system_content: str = SAFETY_SYSTEM_PROMPT,
+    draft_limit: int,
 ) -> PromptRelease:
+    draft_count = await db.scalar(
+        select(func.count()).select_from(PromptRelease).where(PromptRelease.status == "draft")
+    )
+    if (draft_count or 0) >= draft_limit:
+        raise HTTPException(409, "prompt_draft_limit_reached")
     row = PromptRelease(
         id=str(uuid.uuid4()),
         name=name,

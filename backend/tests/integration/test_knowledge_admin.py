@@ -15,6 +15,7 @@ from medical_agent.api import dependencies
 from medical_agent.api.router import api_router
 from medical_agent.core.config import Settings
 from medical_agent.core.database import Base, get_db
+from medical_agent.modules.conversation import service as conversation_service
 from medical_agent.modules.conversation.models import Conversation, Message
 from medical_agent.modules.knowledge import admin_router, retriever, service
 from medical_agent.modules.knowledge.models import (
@@ -62,6 +63,7 @@ async def admin(
     monkeypatch.setattr(dependencies, "get_settings", lambda: settings)
     monkeypatch.setattr(admin_router, "get_settings", lambda: settings)
     monkeypatch.setattr(admin_router, "session_factory", factory)
+    monkeypatch.setattr(conversation_service, "get_settings", lambda: settings)
     monkeypatch.setattr(service, "build_embedding_provider", fake_embedding)
     monkeypatch.setattr(retriever, "build_embedding_provider", fake_embedding)
 
@@ -93,6 +95,22 @@ async def add(client: AsyncClient, release_id: str, **changes: str) -> dict[str,
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_drafts_are_bounded(
+    admin: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+) -> None:
+    client, _ = admin
+    for index in range(5):
+        assert (
+            await client.post(f"{PREFIX}/releases", json={"name": f"草稿 {index + 1}"})
+        ).status_code == 201
+
+    rejected = await client.post(f"{PREFIX}/releases", json={"name": "第六个草稿"})
+
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"] == "knowledge_draft_limit_reached"
 
 
 @pytest.mark.asyncio
@@ -153,6 +171,55 @@ async def test_overview_counts_each_user_message_as_one_interaction(
     overview = await client.get(PREFIX + "/overview")
     assert overview.status_code == 200
     assert overview.json()["interaction_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_multi_turn_conversation_test_uses_real_flow_and_cleans_up(
+    admin: tuple[AsyncClient, async_sessionmaker[AsyncSession]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, factory = admin
+
+    class StreamOnlyProvider:
+        async def complete(self, _: object) -> str:
+            raise AssertionError("admin test must use the patient streaming path")
+
+        async def stream(self, _: object) -> AsyncIterator[str]:
+            yield "患者端"
+            yield "流式回答。"
+
+    monkeypatch.setattr(
+        conversation_service,
+        "build_chat_provider",
+        lambda _: StreamOnlyProvider(),
+    )
+    stream_settings = conversation_service.get_settings().model_copy(
+        update={"rag_enabled": False}
+    )
+    monkeypatch.setattr(conversation_service, "get_settings", lambda: stream_settings)
+    before = (await client.get(PREFIX + "/overview")).json()["interaction_count"]
+    response = await client.post(
+        PREFIX + "/conversation-tests",
+        json={"turns": [{"content": "第一轮问题"}, {"content": "基于上一轮继续追问"}]},
+    )
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["turn_count"] == 2
+    assert [item["turn"] for item in payload["turns"]] == [1, 2]
+    assert [item["output"] for item in payload["turns"]] == [
+        "患者端流式回答。",
+        "患者端流式回答。",
+    ]
+    assert all("duration_ms" in item for item in payload["turns"])
+    assert all("knowledge_hits" in item for item in payload["turns"])
+
+    async with factory() as db:
+        temporary = await db.scalar(
+            select(Conversation).where(Conversation.owner_id.like("admin-test-%"))
+        )
+        assert temporary is None
+    after = (await client.get(PREFIX + "/overview")).json()["interaction_count"]
+    assert after == before
 
 
 @pytest.mark.asyncio

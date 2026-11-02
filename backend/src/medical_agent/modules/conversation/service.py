@@ -9,7 +9,9 @@ from datetime import UTC, datetime
 from weakref import WeakValueDictionary
 
 from fastapi import HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from medical_agent.core.config import Settings, get_settings
 from medical_agent.core.database import session_factory
@@ -39,6 +41,45 @@ RAG_NO_MATCH_RESPONSE = (
 # per conversation prevents duplicate sequence numbers until production moves to
 # PostgreSQL, where the repository can replace this with SELECT ... FOR UPDATE.
 _conversation_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+_background_generations: set[asyncio.Task[None]] = set()
+_background_generation_ids: set[str] = set()
+
+
+def _background_generation_done(task: asyncio.Task[None], conversation_id: str) -> None:
+    _background_generations.discard(task)
+    _background_generation_ids.discard(conversation_id)
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.exception("conversation_disconnect_recovery_failed")
+
+
+def _schedule_disconnect_recovery(
+    *,
+    conversation_id: str,
+    user_message_id: str,
+    input_mode: str,
+    interaction_id: str,
+    started: float,
+    transport: str,
+) -> None:
+    recovery = asyncio.create_task(
+        _continue_interrupted_generation(
+            conversation_id=conversation_id,
+            user_message_id=user_message_id,
+            input_mode=input_mode,
+            interaction_id=interaction_id,
+            started=started,
+            transport=transport,
+        )
+    )
+    _background_generations.add(recovery)
+    _background_generation_ids.add(conversation_id)
+    recovery.add_done_callback(
+        lambda task: _background_generation_done(task, conversation_id)
+    )
 
 
 def _conversation_lock(conversation_id: str) -> asyncio.Lock:
@@ -47,6 +88,11 @@ def _conversation_lock(conversation_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _conversation_locks[conversation_id] = lock
     return lock
+
+
+def is_generation_pending(conversation_id: str) -> bool:
+    lock = _conversation_locks.get(conversation_id)
+    return conversation_id in _background_generation_ids or bool(lock and lock.locked())
 
 
 def _content_log_fields(
@@ -355,6 +401,130 @@ async def _save_interrupted_message(*, conversation_id: str, content: str) -> No
         )
 
 
+async def _continue_interrupted_generation(
+    *,
+    conversation_id: str,
+    user_message_id: str,
+    input_mode: str,
+    interaction_id: str,
+    started: float,
+    transport: str,
+) -> None:
+    """Finish a turn after the browser disconnects before receiving the first token."""
+    async with _conversation_lock(conversation_id), session_factory() as db:
+        conversation = await db.get(Conversation, conversation_id)
+        user_message = await db.scalar(
+            select(Message)
+            .where(Message.id == user_message_id, Message.conversation_id == conversation_id)
+            .options(selectinload(Message.attachments))
+        )
+        if conversation is None or user_message is None:
+            return
+        existing_answer = await db.scalar(
+            select(Message.id)
+            .where(
+                Message.conversation_id == conversation_id,
+                Message.role == "assistant",
+                Message.sequence_no > user_message.sequence_no,
+            )
+            .order_by(Message.sequence_no)
+            .limit(1)
+        )
+        if existing_answer is not None:
+            return
+
+        settings = get_settings()
+        business_prompt, prompt_release_id, prompt_checksum = (
+            await prompt_service.current_runtime_prompt(db)
+        )
+        attachments = list(user_message.attachments)
+        images = await media_service.load_image_inputs(attachments, settings=settings)
+        model_image_count = len(images)
+        knowledge_hits: list[RetrievalHit] = []
+        decision = evaluate_user_input(user_message.content)
+        interaction_error: str | None = None
+        if decision.action != "allow":
+            assistant_content = decision.response or "当前问题无法由科普助手处理。"
+        else:
+            knowledge_context = ""
+            if settings.rag_enabled:
+                knowledge_context, knowledge_hits = await knowledge_service.retrieve_context(
+                    db, query=user_message.content, settings=settings
+                )
+            provider = build_chat_provider(settings)
+            model_messages, images_by_message, conversation_memory = await _model_context(
+                db,
+                conversation=conversation,
+                current_message=user_message,
+                current_images=images,
+                provider=provider,
+                settings=settings,
+            )
+            model_image_count = sum(len(items) for items in images_by_message.values())
+            if (
+                settings.rag_enabled
+                and settings.rag_require_match
+                and not knowledge_hits
+                and model_image_count == 0
+            ):
+                assistant_content = RAG_NO_MATCH_RESPONSE
+                decision = SafetyDecision(action="fallback", code="knowledge_not_found")
+            else:
+                try:
+                    assistant_content = await provider.complete(
+                        _chat_turns(
+                            model_messages,
+                            images_by_message=images_by_message,
+                            business_prompt=business_prompt,
+                            knowledge_context=knowledge_context,
+                            conversation_memory=conversation_memory,
+                        )
+                    )
+                    if knowledge_hits:
+                        assistant_content += knowledge_service.citation_markdown(knowledge_hits)
+                except ProviderError as exc:
+                    interaction_error = str(exc)
+                    assistant_content = "服务暂时无法完成回答，请稍后重试。"
+                    decision = SafetyDecision(action="fallback", code="provider_unavailable")
+
+        assistant_message = await repository.add_message(
+            db,
+            conversation=conversation,
+            role="assistant",
+            content=assistant_content,
+            safety_code=decision.code,
+        )
+        await db.commit()
+        duration_ms = (time.perf_counter() - started) * 1000
+        _record_interaction(
+            interaction_id=interaction_id,
+            conversation=conversation,
+            user_message=user_message,
+            assistant_message_id=assistant_message.id,
+            input_text=user_message.content,
+            output_text=assistant_content,
+            input_mode=input_mode,
+            attachments=attachments,
+            knowledge_hits=knowledge_hits,
+            settings=settings,
+            status=assistant_message.status,
+            safety_code=assistant_message.safety_code,
+            duration_ms=duration_ms,
+            transport=f"{transport}_disconnect_recovery",
+            prompt_release_id=prompt_release_id,
+            prompt_checksum=prompt_checksum,
+            model_image_count=model_image_count,
+            error_code=interaction_error,
+        )
+        logger.info(
+            "conversation_disconnect_recovered",
+            conversation_id=conversation_id,
+            user_message_id=user_message_id,
+            assistant_message_id=assistant_message.id,
+            duration_ms=round(duration_ms, 2),
+        )
+
+
 async def require_conversation(
     db: AsyncSession,
     *,
@@ -379,6 +549,8 @@ async def send_message(
     attachment_ids: list[str] | None = None,
     input_mode: str = "text",
     transport: str = "request_response",
+    record_interaction: bool = True,
+    diagnostics: dict[str, object] | None = None,
 ) -> tuple[Message, Message]:
     async with _conversation_lock(conversation.id):
         started = time.perf_counter()
@@ -469,26 +641,46 @@ async def send_message(
             safety_code=assistant_message.safety_code,
             content_length=len(assistant_content),
         )
-        _record_interaction(
-            interaction_id=interaction_id,
-            conversation=conversation,
-            user_message=user_message,
-            assistant_message_id=assistant_message.id,
-            input_text=normalized_content,
-            output_text=assistant_content,
-            input_mode=input_mode,
-            attachments=attachments,
-            knowledge_hits=knowledge_hits,
-            settings=settings,
-            status=assistant_message.status,
-            safety_code=assistant_message.safety_code,
-            duration_ms=(time.perf_counter() - started) * 1000,
-            transport=transport,
-            prompt_release_id=prompt_release_id,
-            prompt_checksum=prompt_checksum,
-            model_image_count=model_image_count,
-            error_code=interaction_error,
-        )
+        duration_ms = (time.perf_counter() - started) * 1000
+        if diagnostics is not None:
+            diagnostics.update(
+                duration_ms=round(duration_ms, 2),
+                rag_enabled=settings.rag_enabled,
+                knowledge_hits=[
+                    {
+                        "entry_id": hit.entry_id,
+                        "question": hit.question,
+                        "category": hit.category,
+                        "score": hit.score,
+                    }
+                    for hit in knowledge_hits
+                ],
+                prompt_release_id=prompt_release_id,
+                model=settings.vision_model if model_image_count else settings.llm_model,
+                memory_through_sequence=conversation.memory_through_sequence,
+                memory_summary_length=len(conversation.memory_summary),
+            )
+        if record_interaction:
+            _record_interaction(
+                interaction_id=interaction_id,
+                conversation=conversation,
+                user_message=user_message,
+                assistant_message_id=assistant_message.id,
+                input_text=normalized_content,
+                output_text=assistant_content,
+                input_mode=input_mode,
+                attachments=attachments,
+                knowledge_hits=knowledge_hits,
+                settings=settings,
+                status=assistant_message.status,
+                safety_code=assistant_message.safety_code,
+                duration_ms=duration_ms,
+                transport=transport,
+                prompt_release_id=prompt_release_id,
+                prompt_checksum=prompt_checksum,
+                model_image_count=model_image_count,
+                error_code=interaction_error,
+            )
         return user_message, assistant_message
 
 
@@ -499,6 +691,9 @@ async def stream_message(
     content: str,
     attachment_ids: list[str] | None = None,
     input_mode: str = "text",
+    transport: str = "sse",
+    record_interaction: bool = True,
+    diagnostics: dict[str, object] | None = None,
 ) -> AsyncIterator[tuple[str, Message | str]]:
     """Persist a user turn and its media, then yield model output as it arrives."""
     async with _conversation_lock(conversation.id):
@@ -520,7 +715,20 @@ async def stream_message(
         model_image_count = len(images)
         await db.commit()
         await db.refresh(user_message)
-        yield "user_message", user_message
+        stream_resumed = False
+        try:
+            yield "user_message", user_message
+            stream_resumed = True
+        finally:
+            if not stream_resumed and record_interaction:
+                _schedule_disconnect_recovery(
+                    conversation_id=conversation.id,
+                    user_message_id=user_message.id,
+                    input_mode=input_mode,
+                    interaction_id=interaction_id,
+                    started=started,
+                    transport=transport,
+                )
 
         decision = evaluate_user_input(normalized_content)
         chunks: list[str] = []
@@ -627,51 +835,72 @@ async def stream_message(
                 safety_code=assistant_message.safety_code,
                 content_length=len(assistant_content),
             )
-            _record_interaction(
-                interaction_id=interaction_id,
-                conversation=conversation,
-                user_message=user_message,
-                assistant_message_id=assistant_message.id,
-                input_text=normalized_content,
-                output_text=assistant_content,
-                input_mode=input_mode,
-                attachments=attachments,
-                knowledge_hits=knowledge_hits,
-                settings=settings,
-                status=assistant_message.status,
-                safety_code=assistant_message.safety_code,
-                duration_ms=(time.perf_counter() - started) * 1000,
-                transport="sse",
-                prompt_release_id=prompt_release_id,
-                prompt_checksum=prompt_checksum,
-                model_image_count=model_image_count,
-                error_code=interaction_error,
-            )
-            yield "done", assistant_message
-        finally:
-            if not assistant_saved:
-                partial_content = "".join(chunks).strip()
+            duration_ms = (time.perf_counter() - started) * 1000
+            if diagnostics is not None:
+                diagnostics.update(
+                    duration_ms=round(duration_ms, 2),
+                    rag_enabled=settings.rag_enabled,
+                    knowledge_hits=[
+                        {
+                            "entry_id": hit.entry_id,
+                            "question": hit.question,
+                            "category": hit.category,
+                            "score": hit.score,
+                        }
+                        for hit in knowledge_hits
+                    ],
+                    prompt_release_id=prompt_release_id,
+                    model=settings.vision_model if model_image_count else settings.llm_model,
+                    memory_through_sequence=conversation.memory_through_sequence,
+                    memory_summary_length=len(conversation.memory_summary),
+                )
+            if record_interaction:
                 _record_interaction(
                     interaction_id=interaction_id,
                     conversation=conversation,
                     user_message=user_message,
-                    assistant_message_id=None,
+                    assistant_message_id=assistant_message.id,
                     input_text=normalized_content,
-                    output_text=partial_content,
+                    output_text=assistant_content,
                     input_mode=input_mode,
                     attachments=attachments,
                     knowledge_hits=knowledge_hits,
                     settings=settings,
-                    status="interrupted" if partial_content else "failed",
-                    safety_code=decision.code,
-                    duration_ms=(time.perf_counter() - started) * 1000,
-                    transport="sse",
+                    status=assistant_message.status,
+                    safety_code=assistant_message.safety_code,
+                    duration_ms=duration_ms,
+                    transport=transport,
                     prompt_release_id=prompt_release_id,
                     prompt_checksum=prompt_checksum,
                     model_image_count=model_image_count,
-                    error_code=interaction_error or "generation_not_completed",
+                    error_code=interaction_error,
                 )
+            yield "done", assistant_message
+        finally:
+            if not assistant_saved:
+                partial_content = "".join(chunks).strip()
                 if partial_content:
+                    if record_interaction:
+                        _record_interaction(
+                            interaction_id=interaction_id,
+                            conversation=conversation,
+                            user_message=user_message,
+                            assistant_message_id=None,
+                            input_text=normalized_content,
+                            output_text=partial_content,
+                            input_mode=input_mode,
+                            attachments=attachments,
+                            knowledge_hits=knowledge_hits,
+                            settings=settings,
+                            status="interrupted",
+                            safety_code=decision.code,
+                            duration_ms=(time.perf_counter() - started) * 1000,
+                            transport=transport,
+                            prompt_release_id=prompt_release_id,
+                            prompt_checksum=prompt_checksum,
+                            model_image_count=model_image_count,
+                            error_code=interaction_error or "generation_not_completed",
+                        )
                     recovery = asyncio.create_task(
                         _save_interrupted_message(
                             conversation_id=conversation.id,
@@ -682,3 +911,12 @@ async def stream_message(
                         await asyncio.shield(recovery)
                     except asyncio.CancelledError:
                         pass
+                elif record_interaction:
+                    _schedule_disconnect_recovery(
+                        conversation_id=conversation.id,
+                        user_message_id=user_message.id,
+                        input_mode=input_mode,
+                        interaction_id=interaction_id,
+                        started=started,
+                        transport=transport,
+                    )
