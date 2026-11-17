@@ -1,0 +1,357 @@
+"""OpenAI-compatible and local demo chat providers."""
+
+import asyncio
+import base64
+import json
+from collections.abc import AsyncIterator
+from typing import cast
+from urllib.parse import urlsplit
+
+import httpx
+
+from medical_agent.core.config import Settings
+from medical_agent.core.logging import get_logger
+from medical_agent.core.redis import capacity_slot
+from medical_agent.providers.llm.protocol import ChatProvider, ChatTurn
+
+logger = get_logger(__name__)
+_clients: dict[tuple[str, float, int], httpx.AsyncClient] = {}
+_client_lock = asyncio.Lock()
+
+
+class ProviderError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        upstream_code: str = "",
+        upstream_message: str = "",
+        request_id: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.upstream_code = upstream_code[:100]
+        self.upstream_message = " ".join(upstream_message.split())[:700]
+        self.request_id = request_id[:120]
+
+
+async def _client_for(base_url: str, timeout: float) -> httpx.AsyncClient:
+    key = (base_url.rstrip("/"), timeout, id(httpx.AsyncClient))
+    existing = _clients.get(key)
+    if existing is not None:
+        return existing
+    async with _client_lock:
+        existing = _clients.get(key)
+        if existing is None:
+            existing = httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout),
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+            )
+            _clients[key] = existing
+        return existing
+
+
+async def close_chat_clients() -> None:
+    clients = list(_clients.values())
+    _clients.clear()
+    await asyncio.gather(*(client.aclose() for client in clients), return_exceptions=True)
+
+
+def _provider_error(response: httpx.Response) -> ProviderError:
+    code = ""
+    message = ""
+    try:
+        raw = cast(object, response.json())
+        if isinstance(raw, dict):
+            payload = cast(dict[str, object], raw)
+            raw_error = payload.get("error", payload)
+            if isinstance(raw_error, dict):
+                error = cast(dict[str, object], raw_error)
+                code = str(error.get("code") or error.get("type") or "")
+                message = str(error.get("message") or "")
+    except (ValueError, TypeError):
+        pass
+    request_id = next(
+        (
+            response.headers.get(name, "")
+            for name in ("x-request-id", "x-siliconcloud-trace-id", "x-trace-id")
+            if response.headers.get(name)
+        ),
+        "",
+    )
+    return ProviderError(
+        "model_request_failed",
+        status_code=response.status_code,
+        upstream_code=code,
+        upstream_message=message,
+        request_id=request_id,
+    )
+
+
+class DemoChatProvider:
+    async def complete(self, messages: list[ChatTurn]) -> str:
+        return "".join([chunk async for chunk in self.stream(messages)])
+
+    async def stream(self, messages: list[ChatTurn]) -> AsyncIterator[str]:
+        user_turn = next((item for item in reversed(messages) if item.role == "user"), None)
+        question = user_turn.content if user_turn else ""
+        image_note = (
+            f"，并附带 {len(user_turn.images)} 张图片" if user_turn and user_turn.images else ""
+        )
+        content = (
+            "当前是 Demo 测试模式，会话、媒体历史、RAG 上下文和流式消息功能已经连通，"
+            "但尚未配置支持视觉的正式模型，因此不会分析医学图片。"
+            f"你本次输入的是：{question}{image_note}"
+        )
+        for offset in range(0, len(content), 8):
+            await asyncio.sleep(0.04)
+            yield content[offset : offset + 8]
+
+
+class OpenAICompatibleProvider:
+    def __init__(self, settings: Settings) -> None:
+        self.base_url = settings.llm_base_url.rstrip("/")
+        self.api_key = settings.llm_api_key
+        self.model = settings.llm_model
+        self.max_tokens = settings.llm_max_tokens
+        self.enable_thinking = settings.llm_enable_thinking
+        self.vision_base_url = settings.vision_base_url.rstrip("/")
+        self.vision_api_key = settings.vision_api_key
+        self.vision_model = settings.vision_model
+        self.vision_max_tokens = settings.vision_max_tokens
+        self.vision_enable_thinking = settings.vision_enable_thinking
+        self.timeout = settings.llm_timeout_seconds
+
+    async def complete(self, messages: list[ChatTurn]) -> str:
+        content = "".join([chunk async for chunk in self.stream(messages)]).strip()
+        if not content:
+            raise ProviderError("model_response_empty")
+        return content
+
+    async def stream(self, messages: list[ChatTurn]) -> AsyncIterator[str]:
+        has_images = any(turn.images for turn in messages)
+        base_url = self.vision_base_url if has_images else self.base_url
+        api_key = self.vision_api_key if has_images else self.api_key
+        model = self.vision_model if has_images else self.model
+        max_tokens = self.vision_max_tokens if has_images else self.max_tokens
+        enable_thinking = self.vision_enable_thinking if has_images else self.enable_thinking
+        if not base_url or not api_key or not model:
+            raise ProviderError("model_not_configured")
+        payload: dict[str, object] = {
+            "model": model,
+            "messages": [self.serialize_turn(item) for item in messages],
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if enable_thinking is not None:
+            payload["enable_thinking"] = enable_thinking
+        client = await _client_for(base_url, self.timeout)
+        try:
+            async with asyncio.timeout(self.timeout):
+                async with client.stream(
+                    "POST",
+                    f"{base_url}/chat/completions",
+                    headers={
+                        "Accept": "text/event-stream",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                    json=payload,
+                ) as response:
+                    if response.is_error:
+                        # Retain a bounded error body for protected admin diagnostics.
+                        # ProviderError itself still contains only a stable error code.
+                        body = bytearray()
+                        async for block in response.aiter_bytes():
+                            body.extend(block[: max(0, 16_384 - len(body))])
+                            if len(body) >= 16_384:
+                                break
+                        error_response = httpx.Response(
+                            response.status_code,
+                            headers=response.headers,
+                            content=bytes(body),
+                            request=response.request,
+                        )
+                        raise _provider_error(error_response)
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line or line.startswith(":"):
+                            continue
+                        raw_data = line.removeprefix("data:").strip()
+                        if raw_data == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(raw_data)
+                            choice = data["choices"][0]
+                            content = choice.get("delta", {}).get("content")
+                            if content is None:
+                                content = choice.get("message", {}).get("content")
+                        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+                            raise ProviderError("model_response_invalid") from exc
+                        if isinstance(content, str) and content:
+                            yield content
+        except ProviderError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            raise _provider_error(exc.response) from exc
+        except TimeoutError as exc:
+            raise ProviderError("model_request_timeout", status_code=504) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError("model_request_failed") from exc
+
+    @staticmethod
+    def serialize_turn(turn: ChatTurn) -> dict[str, object]:
+        if not turn.images:
+            return {"role": turn.role, "content": turn.content}
+        content: list[dict[str, object]] = [{"type": "text", "text": turn.content}]
+        for image in turn.images:
+            encoded = base64.b64encode(image.data).decode("ascii")
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image.media_type};base64,{encoded}",
+                        "detail": "auto",
+                    },
+                }
+            )
+        return {"role": turn.role, "content": content}
+
+
+class ResilientChatProvider:
+    """Retry before the first token, then fail over without duplicating partial output."""
+
+    def __init__(
+        self,
+        primary: ChatProvider,
+        *,
+        retry_count: int,
+        fallback: ChatProvider | None = None,
+    ) -> None:
+        self.primary = primary
+        self.retry_count = retry_count
+        self.fallback = fallback
+
+    async def complete(self, messages: list[ChatTurn]) -> str:
+        content = "".join([chunk async for chunk in self.stream(messages)]).strip()
+        if not content:
+            raise ProviderError("model_response_empty")
+        return content
+
+    async def stream(self, messages: list[ChatTurn]) -> AsyncIterator[str]:
+        providers = [
+            *(self.primary for _ in range(self.retry_count + 1)),
+            *([self.fallback] if self.fallback is not None else []),
+        ]
+        last_error: ProviderError | None = None
+        for attempt, provider in enumerate(providers, start=1):
+            emitted = False
+            try:
+                async for chunk in provider.stream(messages):
+                    emitted = True
+                    yield chunk
+                if not emitted:
+                    raise ProviderError("model_response_empty")
+                return
+            except ProviderError as exc:
+                last_error = exc
+                if emitted:
+                    raise
+                next_is_fallback = self.fallback is not None and attempt == self.retry_count + 1
+                logger.warning(
+                    "model_provider_attempt_failed",
+                    attempt=attempt,
+                    primary_retry=attempt <= self.retry_count,
+                    switching_to_fallback=next_is_fallback,
+                    reason=str(exc),
+                    upstream_status=exc.status_code,
+                    upstream_code=exc.upstream_code,
+                    request_id=exc.request_id,
+                    endpoint_host=urlsplit(
+                        getattr(provider, "base_url", "")
+                    ).hostname,
+                    model=getattr(provider, "model", ""),
+                )
+                if attempt <= self.retry_count:
+                    await asyncio.sleep(0.15 * attempt)
+        raise last_error or ProviderError("model_request_failed")
+
+
+class AdmissionControlledChatProvider:
+    """Apply one capability-specific slot to the complete retry/fallback chain."""
+
+    def __init__(self, provider: ChatProvider, settings: Settings) -> None:
+        self._provider = provider
+        self._settings = settings
+
+    async def complete(self, messages: list[ChatTurn]) -> str:
+        content = "".join([chunk async for chunk in self.stream(messages)]).strip()
+        if not content:
+            raise ProviderError("model_response_empty")
+        return content
+
+    async def stream(self, messages: list[ChatTurn]) -> AsyncIterator[str]:
+        has_images = any(turn.images for turn in messages)
+        scope = "vision-model" if has_images else "chat-model"
+        limit = (
+            self._settings.vision_concurrency_limit
+            if has_images
+            else self._settings.model_concurrency_limit
+        )
+        wait_seconds = (
+            self._settings.vision_concurrency_wait_seconds
+            if has_images
+            else self._settings.model_concurrency_wait_seconds
+        )
+        try:
+            async with capacity_slot(
+                self._settings,
+                scope=scope,
+                limit=limit,
+                wait_seconds=wait_seconds,
+            ):
+                async for chunk in self._provider.stream(messages):
+                    yield chunk
+        except TimeoutError as exc:
+            raise ProviderError("model_capacity_exhausted", status_code=503) from exc
+
+
+def _fallback_provider(settings: Settings) -> OpenAICompatibleProvider | None:
+    if not (
+        settings.fallback_llm_base_url
+        and settings.fallback_llm_api_key
+        and settings.fallback_llm_model
+    ):
+        return None
+    fallback_settings = settings.model_copy(
+        update={
+            "llm_provider": "openai-compatible",
+            "llm_base_url": settings.fallback_llm_base_url,
+            "llm_api_key": settings.fallback_llm_api_key,
+            "llm_model": settings.fallback_llm_model,
+            "llm_timeout_seconds": settings.fallback_llm_timeout_seconds,
+            "llm_max_tokens": settings.fallback_llm_max_tokens,
+            "llm_enable_thinking": settings.fallback_llm_enable_thinking,
+            # A multimodal fallback can serve image turns through the same endpoint.
+            "vision_base_url": settings.fallback_llm_base_url,
+            "vision_api_key": settings.fallback_llm_api_key,
+            "vision_model": settings.fallback_llm_model,
+            "vision_max_tokens": settings.fallback_llm_max_tokens,
+            "vision_enable_thinking": settings.fallback_llm_enable_thinking,
+        }
+    )
+    return OpenAICompatibleProvider(fallback_settings)
+
+
+def build_chat_provider(settings: Settings) -> ChatProvider:
+    if settings.llm_provider == "demo":
+        return DemoChatProvider()
+    return AdmissionControlledChatProvider(
+        ResilientChatProvider(
+            OpenAICompatibleProvider(settings),
+            retry_count=settings.llm_retry_count,
+            fallback=_fallback_provider(settings),
+        ),
+        settings,
+    )

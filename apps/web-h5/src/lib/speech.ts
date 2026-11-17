@@ -1,0 +1,181 @@
+export interface AudioRecordingController {
+  stop: () => Promise<File | null>;
+  cancel: () => void;
+}
+
+export type RecordingCue = "start" | "stop";
+
+const MIME_TYPE_CANDIDATES = [
+  "audio/webm;codecs=opus",
+  "audio/webm",
+  "audio/mp4",
+  "audio/ogg;codecs=opus",
+];
+
+function preferredMimeType(): string | undefined {
+  return MIME_TYPE_CANDIDATES.find((item) => MediaRecorder.isTypeSupported(item));
+}
+
+function extensionForMimeType(mimeType: string): string {
+  if (mimeType.startsWith("audio/mp4")) return "m4a";
+  if (mimeType.startsWith("audio/ogg")) return "ogg";
+  return "webm";
+}
+
+export function audioRecordingSupported(): boolean {
+  return (
+    window.isSecureContext &&
+    typeof MediaRecorder !== "undefined" &&
+    typeof navigator.mediaDevices?.getUserMedia === "function"
+  );
+}
+
+export async function playRecordingCue(cue: RecordingCue): Promise<void> {
+  if (typeof AudioContext === "undefined") return;
+  let context: AudioContext | null = null;
+  try {
+    context = new AudioContext();
+    await context.resume();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    const startedAt = context.currentTime;
+    const duration = cue === "start" ? 0.09 : 0.07;
+
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(cue === "start" ? 720 : 480, startedAt);
+    gain.gain.setValueAtTime(0.0001, startedAt);
+    gain.gain.exponentialRampToValueAtTime(0.045, startedAt + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startedAt + duration);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+
+    await new Promise<void>((resolve) => {
+      oscillator.onended = () => resolve();
+      oscillator.start(startedAt);
+      oscillator.stop(startedAt + duration);
+    });
+  } catch {
+    // Recording remains available when a browser blocks nonessential cue audio.
+  } finally {
+    if (context && context.state !== "closed") await context.close().catch(() => undefined);
+  }
+}
+
+export async function startAudioRecording(onLevel?: (level: number) => void): Promise<AudioRecordingController> {
+  if (!audioRecordingSupported()) throw new Error("recording_not_supported");
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
+    video: false,
+  });
+  const requestedMimeType = preferredMimeType();
+  let recorder: MediaRecorder;
+  try {
+    recorder = new MediaRecorder(
+      stream,
+      requestedMimeType ? { mimeType: requestedMimeType } : undefined,
+    );
+  } catch (error) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw error;
+  }
+
+  const chunks: Blob[] = [];
+  let audioContext: AudioContext | null = null;
+  let levelFrame = 0;
+  if (onLevel && typeof AudioContext !== "undefined") {
+    try {
+      audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser(); analyser.fftSize = 256;
+      source.connect(analyser);
+      void audioContext.resume().catch(() => undefined);
+      const samples = new Uint8Array(analyser.fftSize);
+      let lastUpdate = 0;
+      const measure = (time: number) => {
+        if (time - lastUpdate > 70) {
+          analyser.getByteTimeDomainData(samples);
+          const rms = Math.sqrt(samples.reduce((sum, value) => sum + ((value - 128) / 128) ** 2, 0) / samples.length);
+          onLevel(Math.min(1, rms * 5)); lastUpdate = time;
+        }
+        levelFrame = requestAnimationFrame(measure);
+      };
+      levelFrame = requestAnimationFrame(measure);
+    } catch { /* Recording stays available if the device cannot expose audio levels. */ }
+  }
+  let cancelled = false;
+  let settled = false;
+  let resolveStopped: (file: File | null) => void = () => undefined;
+  const stopped = new Promise<File | null>((resolve) => {
+    resolveStopped = resolve;
+  });
+
+  function releaseStream() {
+    cancelAnimationFrame(levelFrame);
+    if (audioContext && audioContext.state !== "closed") void audioContext.close().catch(() => undefined);
+    onLevel?.(0);
+    stream.getTracks().forEach((track) => track.stop());
+  }
+
+  function settle(file: File | null) {
+    if (settled) return;
+    settled = true;
+    releaseStream();
+    resolveStopped(file);
+  }
+
+  recorder.ondataavailable = (event) => {
+    if (event.data.size > 0) chunks.push(event.data);
+  };
+  recorder.onerror = () => settle(null);
+  recorder.onstop = () => {
+    if (cancelled || chunks.length === 0) {
+      settle(null);
+      return;
+    }
+    const mimeType = recorder.mimeType || requestedMimeType || "audio/webm";
+    const blob = new Blob(chunks, { type: mimeType });
+    settle(
+      new File([blob], `recording-${Date.now()}.${extensionForMimeType(mimeType)}`, {
+        type: mimeType,
+        lastModified: Date.now(),
+      }),
+    );
+  };
+
+  try {
+    await playRecordingCue("start");
+    recorder.start(250);
+  } catch (error) {
+    releaseStream();
+    throw error;
+  }
+
+  return {
+    stop: async () => {
+      if (recorder.state !== "inactive") recorder.stop();
+      return stopped;
+    },
+    cancel: () => {
+      cancelled = true;
+      if (recorder.state !== "inactive") recorder.stop();
+      else settle(null);
+    },
+  };
+}
+
+export function readableRecordingError(error: unknown): string {
+  if (error instanceof DOMException) {
+    if (error.name === "NotAllowedError") return "无法使用麦克风，请检查浏览器权限。";
+    if (error.name === "NotFoundError") return "没有检测到可用的麦克风。";
+    if (error.name === "NotReadableError") return "麦克风正被其他应用占用。";
+  }
+  if (error instanceof Error && error.message === "recording_not_supported") {
+    return "当前环境不支持录音，请使用 HTTPS 或 localhost 打开。";
+  }
+  return "录音失败，请重试。";
+}

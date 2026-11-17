@@ -1,0 +1,68 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+.certs/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.venv/
+backend/.venv/
+.coverage
+.coverage.*
+htmlcov/
+
+# Node
+node_modules/
+dist/
+coverage/
+.vite/
+.pnpm-store/
+playwright-report/
+test-results/
+blob-report/
+*-debug.log*
+
+# Runtime data (never commit patient or hospital data)
+/runtime/
+data/
+uploads/
+models/
+logs/
+private/
+hospital-data/
+source-materials/
+exports/
+backups/
+*.log
+*.db
+*.sqlite*
+*.pid
+*.tmp
+
+# Generated artifacts
+.artifacts/
+/admin-web-dist.tar.gz
+/medical-agent-backend.tar.gz
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Domain-verification files are served only from the patient H5 public directory.
+/WW_verify_*.txt
+/apps/admin-web/WW_verify_*.txt
+/apps/web-h5/WW_verify_*.txt
+

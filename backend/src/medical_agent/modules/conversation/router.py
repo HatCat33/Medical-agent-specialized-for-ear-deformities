@@ -1,0 +1,231 @@
+"""Conversation, message, and history endpoints."""
+
+import json
+import uuid
+from collections.abc import AsyncIterator
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from medical_agent.api.dependencies import current_owner_id
+from medical_agent.core.config import get_settings
+from medical_agent.core.database import get_db
+from medical_agent.core.logging import get_logger
+from medical_agent.core.redis import store
+from medical_agent.modules.conversation import repository, service
+from medical_agent.modules.conversation.models import Message
+from medical_agent.modules.conversation.schemas import (
+    ConversationCreate,
+    ConversationDetail,
+    ConversationRead,
+    MessageRead,
+    SendMessageRequest,
+    SendMessageResponse,
+)
+from medical_agent.modules.media import service as media_service
+
+router = APIRouter(prefix="/conversations", tags=["conversations"])
+logger = get_logger(__name__)
+DbSession = Annotated[AsyncSession, Depends(get_db)]
+OwnerId = Annotated[str, Depends(current_owner_id)]
+
+
+async def _enforce_chat_rate_limit(owner_id: str) -> None:
+    settings = get_settings()
+    allowed, retry_after = await store.allow_request(
+        scope="chat",
+        subject=owner_id,
+        limit=settings.chat_rate_limit_requests,
+        window_seconds=settings.chat_rate_limit_window_seconds,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="chat_rate_limit_exceeded",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+async def _claim_message(owner_id: str, payload: SendMessageRequest) -> None:
+    if payload.client_request_id is None:
+        return
+    settings = get_settings()
+    key = store.key(
+        "idempotency",
+        "chat",
+        service.request_identity(owner_id, payload.client_request_id),
+    )
+    if not await store.claim_once(key, ttl_seconds=settings.chat_idempotency_ttl_seconds):
+        raise HTTPException(status_code=409, detail="duplicate_message_request")
+
+
+@router.get("", response_model=list[ConversationRead])
+async def list_conversations(db: DbSession, owner_id: OwnerId) -> list[ConversationRead]:
+    items = await repository.list_conversations(db, owner_id=owner_id)
+    return [ConversationRead.model_validate(item) for item in items]
+
+
+@router.post("", response_model=ConversationRead, status_code=status.HTTP_201_CREATED)
+async def create_conversation(
+    payload: ConversationCreate,
+    db: DbSession,
+    owner_id: OwnerId,
+) -> ConversationRead:
+    title = (payload.title or "新会话").strip() or "新会话"
+    if title == "新会话":
+        conversation = await repository.get_or_create_empty_conversation(
+            db, owner_id=owner_id, title=title,
+        )
+    else:
+        conversation = await repository.create_conversation(
+            db, owner_id=owner_id, title=title,
+        )
+    await db.commit()
+    await db.refresh(conversation)
+    return ConversationRead.model_validate(conversation)
+
+
+@router.get("/{conversation_id}", response_model=ConversationDetail)
+async def get_conversation(
+    conversation_id: str,
+    db: DbSession,
+    owner_id: OwnerId,
+) -> ConversationDetail:
+    conversation = await service.require_conversation(
+        db,
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+    )
+    messages = await repository.list_messages(db, conversation_id=conversation.id)
+    return ConversationDetail(
+        **ConversationRead.model_validate(conversation).model_dump(),
+        messages=[MessageRead.model_validate(message) for message in messages],
+        generation_pending=await service.is_generation_pending(conversation.id),
+    )
+
+
+@router.post("/{conversation_id}/messages", response_model=SendMessageResponse)
+async def send_message(
+    conversation_id: str,
+    payload: SendMessageRequest,
+    db: DbSession,
+    owner_id: OwnerId,
+) -> SendMessageResponse:
+    await _enforce_chat_rate_limit(owner_id)
+    await _claim_message(owner_id, payload)
+    conversation = await service.require_conversation(
+        db,
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+    )
+    generation_key = store.key("generation", conversation.id)
+    generation_token = uuid.uuid4().hex
+    await store.set_bytes(generation_key, generation_token.encode(), ttl_seconds=600)
+    try:
+        user_message, assistant_message = await service.send_message(
+            db,
+            conversation=conversation,
+            content=payload.content,
+            attachment_ids=payload.attachment_ids,
+            input_mode=payload.input_mode,
+        )
+    finally:
+        await store.delete_if_value(generation_key, generation_token)
+    return SendMessageResponse(
+        conversation=ConversationRead.model_validate(conversation),
+        user_message=MessageRead.model_validate(user_message),
+        assistant_message=MessageRead.model_validate(assistant_message),
+    )
+
+
+@router.post("/{conversation_id}/messages/stream", response_class=StreamingResponse)
+async def stream_message(
+    conversation_id: str,
+    payload: SendMessageRequest,
+    db: DbSession,
+    owner_id: OwnerId,
+) -> StreamingResponse:
+    await _enforce_chat_rate_limit(owner_id)
+    await _claim_message(owner_id, payload)
+    conversation = await service.require_conversation(
+        db,
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+    )
+
+    async def event_stream() -> AsyncIterator[str]:
+        generation_key = store.key("generation", conversation.id)
+        generation_token = uuid.uuid4().hex
+        await store.set_bytes(generation_key, generation_token.encode(), ttl_seconds=600)
+        try:
+            async for event, value in service.stream_message(
+                db,
+                conversation=conversation,
+                content=payload.content,
+                attachment_ids=payload.attachment_ids,
+                input_mode=payload.input_mode,
+            ):
+                if event in {"user_message", "done"}:
+                    if not isinstance(value, Message):
+                        raise TypeError("stream_message_event_invalid")
+                    data = {"message": MessageRead.model_validate(value).model_dump(mode="json")}
+                else:
+                    data = {"content": value}
+                encoded = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                yield f"event: {event}\ndata: {encoded}\n\n"
+        # Once streaming starts, failures must be reported inside the event stream.
+        except Exception:
+            logger.exception(
+                "conversation_stream_failed",
+                conversation_id=conversation_id,
+            )
+            await db.rollback()
+            encoded = json.dumps(
+                {"message": "消息生成失败，请稍后重试。"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            yield f"event: error\ndata: {encoded}\n\n"
+        finally:
+            await store.delete_if_value(generation_key, generation_token)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.delete("/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_conversation(
+    conversation_id: str,
+    db: DbSession,
+    owner_id: OwnerId,
+) -> Response:
+    await service.require_conversation(
+        db,
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+    )
+    await media_service.delete_conversation_media(
+        db,
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+        settings=get_settings(),
+    )
+    deleted = await repository.delete_conversation(
+        db,
+        conversation_id=conversation_id,
+        owner_id=owner_id,
+    )
+    if not deleted:
+        raise RuntimeError("conversation_delete_failed")
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+

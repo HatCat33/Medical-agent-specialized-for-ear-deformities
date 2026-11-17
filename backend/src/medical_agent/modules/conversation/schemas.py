@@ -1,0 +1,78 @@
+"""Conversation API contracts."""
+
+from datetime import UTC, datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+
+from medical_agent.modules.media.schemas import MediaRead
+
+
+class ConversationCreate(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+
+
+class ConversationRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    title: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    last_message_at: datetime | None
+
+    @field_serializer("created_at", "updated_at", "last_message_at")
+    def serialize_utc(self, value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+class MessageRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    conversation_id: str
+    sequence_no: int
+    role: str
+    content: str
+    status: str
+    safety_code: str | None
+    created_at: datetime
+    attachments: list[MediaRead] = Field(default_factory=lambda: list[MediaRead]())
+
+    @field_serializer("created_at")
+    def serialize_utc(self, value: datetime) -> str:
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+class ConversationDetail(ConversationRead):
+    messages: list[MessageRead]
+    generation_pending: bool = False
+
+
+class SendMessageRequest(BaseModel):
+    content: str = Field(default="", max_length=4000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=4)
+    input_mode: Literal["text", "voice", "multimodal"] = "text"
+    client_request_id: str | None = Field(default=None, min_length=8, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_content_or_attachments(self) -> "SendMessageRequest":
+        if not self.content.strip() and not self.attachment_ids:
+            raise ValueError("content_or_attachment_required")
+        if len(set(self.attachment_ids)) != len(self.attachment_ids):
+            raise ValueError("duplicate_attachment_ids")
+        return self
+
+
+class SendMessageResponse(BaseModel):
+    conversation: ConversationRead
+    user_message: MessageRead
+    assistant_message: MessageRead
+

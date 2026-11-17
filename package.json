@@ -1,0 +1,36 @@
+{
+  "name": "medical-agent-workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.25.0",
+  "scripts": {
+    "dev:h5": "pnpm --filter @medical-agent/web-h5 dev",
+    "setup:https": "powershell -ExecutionPolicy Bypass -File infra/scripts/setup-dev-https.ps1",
+    "dev:admin": "pnpm --filter @medical-agent/admin-web dev",
+    "build": "pnpm -r build",
+    "lint": "eslint .",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "test:e2e:visual": "node tests/e2e/patient/visual-smoke.mjs",
+    "test:e2e:stream": "node tests/e2e/patient/streaming-smoke.mjs",
+    "test:e2e:voice": "node tests/e2e/patient/voice-input-smoke.mjs",
+    "test:e2e:playback": "node tests/e2e/speech/playback-smoke.mjs",
+    "test:e2e:continuous-speech": "node tests/e2e/speech/continuous-playback-smoke.mjs",
+    "test:e2e:pcm-stream-speech": "node tests/e2e/speech/pcm-stream-smoke.mjs",
+    "test:e2e:patient-ui": "node tests/e2e/patient/ui-mock-smoke.mjs",
+    "test:e2e:markdown": "node tests/e2e/patient/markdown-spacing-smoke.mjs",
+    "test:e2e:admin": "node tests/e2e/admin/backend-smoke.mjs",
+    "test:e2e:admin-ui": "node tests/e2e/admin/ui-mock-smoke.mjs",
+    "test:load": "uv run --project backend --no-sync python tests/load/concurrent_chat.py"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.0",
+    "@playwright/test": "^1.64.0",
+    "eslint": "^10.0.0",
+    "eslint-plugin-react-hooks": "^7.0.0",
+    "eslint-plugin-react-refresh": "^0.5.0",
+    "globals": "^17.0.0",
+    "typescript-eslint": "^8.0.0"
+  }
+}
+

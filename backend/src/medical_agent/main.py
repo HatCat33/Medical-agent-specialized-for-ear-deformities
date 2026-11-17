@@ -1,0 +1,91 @@
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from medical_agent.api.router import api_router
+from medical_agent.core.config import get_settings
+from medical_agent.core.database import close_db, init_db
+from medical_agent.core.logging import configure_logging
+from medical_agent.core.middleware import RequestContextMiddleware
+from medical_agent.core.redis import close_redis, init_redis
+from medical_agent.modules.channels.wechat_kf.service import runtime as wechat_kf_runtime
+from medical_agent.modules.channels.wecom.service import runtime as wecom_runtime
+from medical_agent.modules.speech.synthesis import close_synthesis_clients
+from medical_agent.providers.embedding.client import close_embedding_clients
+from medical_agent.providers.llm.client import close_chat_clients
+from medical_agent.providers.rerank.client import close_reranker_clients
+from medical_agent.providers.speech.client import close_speech_clients
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await init_db()
+    # The embedded job runner is for one API process. Recover interrupted jobs
+    # on startup; completed batches remain available for explicit retry.
+    from sqlalchemy import update
+
+    from medical_agent.core.database import session_factory
+    from medical_agent.modules.knowledge.models import KnowledgeOperation
+    from medical_agent.modules.system.model_config_service import load_runtime_model_configuration
+
+    async with session_factory() as db:
+        await load_runtime_model_configuration(db)
+        await db.execute(
+            update(KnowledgeOperation)
+            .where(KnowledgeOperation.active_slot.is_not(None))
+            .values(status="interrupted", active_slot=None, error="server_restarted_retry_required")
+        )
+        await db.commit()
+    await init_redis(get_settings())
+    await wecom_runtime.start(get_settings())
+    await wechat_kf_runtime.start(get_settings())
+    try:
+        yield
+    finally:
+        await wechat_kf_runtime.stop()
+        await wecom_runtime.stop()
+        await close_chat_clients()
+        await close_embedding_clients()
+        await close_speech_clients()
+        await close_reranker_clients()
+        await close_synthesis_clients()
+        await close_redis()
+        await close_db()
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+    configure_logging(
+        level=settings.log_level,
+        json_logs=settings.log_json,
+        file_path=settings.resolved_log_file_path,
+        max_bytes=settings.log_max_bytes,
+        log_timezone=settings.log_timezone,
+        log_retention_days=settings.log_retention_days,
+        interaction_enabled=settings.interaction_log_enabled,
+        interaction_file_path=settings.resolved_interaction_log_file_path,
+        interaction_max_bytes=settings.interaction_log_max_bytes,
+        interaction_timezone=settings.interaction_log_timezone,
+        interaction_retention_days=settings.interaction_log_retention_days,
+    )
+    app = FastAPI(title="Medical Agent API", version="0.5.0", lifespan=lifespan)
+    app.add_middleware(RequestContextMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origin_list,
+        allow_origin_regex=settings.cors_origin_regex or None,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.include_router(api_router)
+
+    @app.get("/api/v1/health/live", tags=["health"])
+    async def liveness() -> dict[str, str]:
+        return {"status": "ok", "mode": settings.llm_provider}
+
+    return app
+
+
+app = create_app()

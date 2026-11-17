@@ -1,0 +1,2 @@
+"""Medical Agent application package."""
+
