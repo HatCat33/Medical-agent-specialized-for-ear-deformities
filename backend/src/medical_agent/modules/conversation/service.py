@@ -4,7 +4,8 @@ import asyncio
 import hashlib
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from weakref import WeakValueDictionary
 
@@ -13,9 +14,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from medical_agent.api.dependencies import owner_reference
 from medical_agent.core.config import Settings, get_settings
 from medical_agent.core.database import session_factory
 from medical_agent.core.logging import get_interaction_logger, get_logger
+from medical_agent.core.redis import store
 from medical_agent.modules.conversation import repository, summarizer
 from medical_agent.modules.conversation.models import Conversation, Message
 from medical_agent.modules.knowledge import service as knowledge_service
@@ -24,7 +27,7 @@ from medical_agent.modules.media import service as media_service
 from medical_agent.modules.media.models import MediaObject
 from medical_agent.modules.safety.schemas import SafetyDecision
 from medical_agent.modules.safety.service import evaluate_user_input
-from medical_agent.modules.system import prompt_service
+from medical_agent.modules.system import counter_service, prompt_service
 from medical_agent.providers.llm.client import ProviderError, build_chat_provider
 from medical_agent.providers.llm.protocol import ChatProvider, ChatTurn, ImageInput
 
@@ -66,7 +69,7 @@ def _schedule_disconnect_recovery(
     transport: str,
 ) -> None:
     recovery = asyncio.create_task(
-        _continue_interrupted_generation(
+        _continue_interrupted_generation_with_status(
             conversation_id=conversation_id,
             user_message_id=user_message_id,
             input_mode=input_mode,
@@ -82,6 +85,31 @@ def _schedule_disconnect_recovery(
     )
 
 
+async def _continue_interrupted_generation_with_status(
+    *,
+    conversation_id: str,
+    user_message_id: str,
+    input_mode: str,
+    interaction_id: str,
+    started: float,
+    transport: str,
+) -> None:
+    key = store.key("generation", conversation_id)
+    token = uuid.uuid4().hex
+    await store.set_bytes(key, token.encode(), ttl_seconds=600)
+    try:
+        await _continue_interrupted_generation(
+            conversation_id=conversation_id,
+            user_message_id=user_message_id,
+            input_mode=input_mode,
+            interaction_id=interaction_id,
+            started=started,
+            transport=transport,
+        )
+    finally:
+        await store.delete_if_value(key, token)
+
+
 def _conversation_lock(conversation_id: str) -> asyncio.Lock:
     lock = _conversation_locks.get(conversation_id)
     if lock is None:
@@ -90,9 +118,14 @@ def _conversation_lock(conversation_id: str) -> asyncio.Lock:
     return lock
 
 
-def is_generation_pending(conversation_id: str) -> bool:
+async def is_generation_pending(conversation_id: str) -> bool:
     lock = _conversation_locks.get(conversation_id)
-    return conversation_id in _background_generation_ids or bool(lock and lock.locked())
+    local = conversation_id in _background_generation_ids or bool(lock and lock.locked())
+    return local or await store.exists(store.key("generation", conversation_id))
+
+
+def request_identity(owner_id: str, client_request_id: str) -> str:
+    return hashlib.sha256(f"{owner_id}\x1f{client_request_id}".encode()).hexdigest()
 
 
 def _content_log_fields(
@@ -120,16 +153,44 @@ def _content_log_fields(
     return fields
 
 
+@dataclass(frozen=True)
+class _InteractionSubjects:
+    """Transaction-independent identifiers used by the audit logger."""
+
+    conversation_id: str
+    owner_ref: str
+    user_message_id: str
+    attachment_ids: tuple[str, ...]
+    media_types: tuple[str, ...]
+    memory_through_sequence: int
+    memory_summary_length: int
+
+
+def _capture_interaction_subjects(
+    conversation: Conversation,
+    user_message: Message,
+    attachments: list[MediaObject],
+) -> _InteractionSubjects:
+    """Copy ORM values before a database failure can expire mapped objects."""
+    return _InteractionSubjects(
+        conversation_id=conversation.id,
+        owner_ref=owner_reference(conversation.owner_id),
+        user_message_id=user_message.id,
+        attachment_ids=tuple(attachment.id for attachment in attachments),
+        media_types=tuple(attachment.media_type for attachment in attachments),
+        memory_through_sequence=conversation.memory_through_sequence,
+        memory_summary_length=len(conversation.memory_summary),
+    )
+
+
 def _record_interaction(
     *,
     interaction_id: str,
-    conversation: Conversation,
-    user_message: Message,
+    subjects: _InteractionSubjects,
     assistant_message_id: str | None,
     input_text: str,
     output_text: str,
     input_mode: str,
-    attachments: list[MediaObject],
     knowledge_hits: list[RetrievalHit],
     settings: Settings,
     status: str,
@@ -147,22 +208,22 @@ def _record_interaction(
     model_name = settings.vision_model if has_images else settings.llm_model
     fields: dict[str, object] = {
         "interaction_id": interaction_id,
-        "conversation_id": conversation.id,
-        "owner_ref": hashlib.sha256(conversation.owner_id.encode("utf-8")).hexdigest()[:16],
-        "user_message_id": user_message.id,
+        "conversation_id": subjects.conversation_id,
+        "owner_ref": subjects.owner_ref,
+        "user_message_id": subjects.user_message_id,
         "assistant_message_id": assistant_message_id,
         "transport": transport,
         "input_mode": input_mode,
-        "attachment_count": len(attachments),
+        "attachment_count": len(subjects.attachment_ids),
         "model_image_count": model_image_count,
-        "attachment_ids": [attachment.id for attachment in attachments],
-        "media_types": [attachment.media_type for attachment in attachments],
+        "attachment_ids": subjects.attachment_ids,
+        "media_types": subjects.media_types,
         "provider": settings.llm_provider,
         "model": model_name or ("demo" if settings.llm_provider == "demo" else "unconfigured"),
         "prompt_release_id": prompt_release_id,
         "prompt_checksum": prompt_checksum,
-        "memory_through_sequence": conversation.memory_through_sequence,
-        "memory_summary_length": len(conversation.memory_summary),
+        "memory_through_sequence": subjects.memory_through_sequence,
+        "memory_summary_length": subjects.memory_summary_length,
         "rag_enabled": settings.rag_enabled,
         "rag_hit_count": len(knowledge_hits),
         "rag_hits": [
@@ -192,7 +253,7 @@ def _record_interaction(
         logger.exception(
             "interaction_log_write_failed",
             interaction_id=interaction_id,
-            conversation_id=conversation.id,
+            conversation_id=subjects.conversation_id,
         )
 
 
@@ -350,6 +411,7 @@ async def _prepare_user_message(
     attachment_ids: list[str],
     input_mode: str,
     settings: Settings,
+    count_interaction: bool,
 ) -> tuple[Message, list[MediaObject], str]:
     normalized_content = content.strip() or IMAGE_ONLY_QUESTION
     user_message = await repository.add_message(
@@ -358,6 +420,8 @@ async def _prepare_user_message(
         role="user",
         content=normalized_content,
     )
+    if count_interaction:
+        await counter_service.increment(db, counter_service.PATIENT_INTERACTIONS)
     attachments = await media_service.claim_media(
         db,
         media_ids=attachment_ids,
@@ -438,6 +502,7 @@ async def _continue_interrupted_generation(
             await prompt_service.current_runtime_prompt(db)
         )
         attachments = list(user_message.attachments)
+        subjects = _capture_interaction_subjects(conversation, user_message, attachments)
         images = await media_service.load_image_inputs(attachments, settings=settings)
         model_image_count = len(images)
         knowledge_hits: list[RetrievalHit] = []
@@ -461,6 +526,10 @@ async def _continue_interrupted_generation(
                 settings=settings,
             )
             model_image_count = sum(len(items) for items in images_by_message.values())
+            subjects = _capture_interaction_subjects(conversation, user_message, attachments)
+            # The model request can take tens of seconds. End the read transaction
+            # first so this recovery task does not reserve a pool connection.
+            await db.commit()
             if (
                 settings.rag_enabled
                 and settings.rag_require_match
@@ -498,13 +567,11 @@ async def _continue_interrupted_generation(
         duration_ms = (time.perf_counter() - started) * 1000
         _record_interaction(
             interaction_id=interaction_id,
-            conversation=conversation,
-            user_message=user_message,
+            subjects=subjects,
             assistant_message_id=assistant_message.id,
             input_text=user_message.content,
             output_text=assistant_content,
             input_mode=input_mode,
-            attachments=attachments,
             knowledge_hits=knowledge_hits,
             settings=settings,
             status=assistant_message.status,
@@ -566,9 +633,16 @@ async def send_message(
             attachment_ids=attachment_ids or [],
             input_mode=input_mode,
             settings=settings,
+            count_interaction=record_interaction,
         )
+        subjects = _capture_interaction_subjects(conversation, user_message, attachments)
         images = await media_service.load_image_inputs(attachments, settings=settings)
         model_image_count = len(images)
+        # Persist the patient turn independently. A slow or unavailable model
+        # must not keep the write transaction open or erase the submitted turn.
+        await db.commit()
+        await db.refresh(user_message)
+        subjects = _capture_interaction_subjects(conversation, user_message, attachments)
 
         decision = evaluate_user_input(normalized_content)
         knowledge_hits: list[RetrievalHit] = []
@@ -593,6 +667,8 @@ async def send_message(
                 settings=settings,
             )
             model_image_count = sum(len(items) for items in images_by_message.values())
+            subjects = _capture_interaction_subjects(conversation, user_message, attachments)
+            await db.commit()
             if (
                 settings.rag_enabled
                 and settings.rag_require_match
@@ -618,6 +694,7 @@ async def send_message(
                     interaction_error = str(exc)
                     logger.warning(
                         "model_request_failed",
+                        interaction_id=interaction_id,
                         conversation_id=conversation.id,
                         message_id=user_message.id,
                     )
@@ -635,6 +712,7 @@ async def send_message(
         await db.refresh(conversation)
         logger.info(
             "conversation_answer_completed",
+            interaction_id=interaction_id,
             conversation_id=conversation.id,
             message_id=assistant_message.id,
             status=assistant_message.status,
@@ -663,13 +741,11 @@ async def send_message(
         if record_interaction:
             _record_interaction(
                 interaction_id=interaction_id,
-                conversation=conversation,
-                user_message=user_message,
+                subjects=subjects,
                 assistant_message_id=assistant_message.id,
                 input_text=normalized_content,
                 output_text=assistant_content,
                 input_mode=input_mode,
-                attachments=attachments,
                 knowledge_hits=knowledge_hits,
                 settings=settings,
                 status=assistant_message.status,
@@ -694,7 +770,7 @@ async def stream_message(
     transport: str = "sse",
     record_interaction: bool = True,
     diagnostics: dict[str, object] | None = None,
-) -> AsyncIterator[tuple[str, Message | str]]:
+) -> AsyncGenerator[tuple[str, Message | str], None]:
     """Persist a user turn and its media, then yield model output as it arrives."""
     async with _conversation_lock(conversation.id):
         started = time.perf_counter()
@@ -710,11 +786,13 @@ async def stream_message(
             attachment_ids=attachment_ids or [],
             input_mode=input_mode,
             settings=settings,
+            count_interaction=record_interaction,
         )
         images = await media_service.load_image_inputs(attachments, settings=settings)
         model_image_count = len(images)
         await db.commit()
         await db.refresh(user_message)
+        subjects = _capture_interaction_subjects(conversation, user_message, attachments)
         stream_resumed = False
         try:
             yield "user_message", user_message
@@ -760,6 +838,11 @@ async def stream_message(
                     settings=settings,
                 )
                 model_image_count = sum(len(items) for items in images_by_message.values())
+                subjects = _capture_interaction_subjects(conversation, user_message, attachments)
+                # RAG and history reads start a transaction. Release its connection
+                # before waiting on the upstream SSE stream so concurrent patients
+                # do not exhaust PostgreSQL's pool with idle transactions.
+                await db.commit()
                 if (
                     settings.rag_enabled
                     and settings.rag_require_match
@@ -786,6 +869,7 @@ async def stream_message(
                         interaction_error = str(exc)
                         logger.warning(
                             "model_stream_failed",
+                            interaction_id=interaction_id,
                             conversation_id=conversation.id,
                             message_id=user_message.id,
                             input_type="vision" if model_image_count else "text",
@@ -829,6 +913,7 @@ async def stream_message(
             assistant_saved = True
             logger.info(
                 "conversation_answer_completed",
+                interaction_id=interaction_id,
                 conversation_id=conversation.id,
                 message_id=assistant_message.id,
                 status=assistant_message.status,
@@ -857,13 +942,11 @@ async def stream_message(
             if record_interaction:
                 _record_interaction(
                     interaction_id=interaction_id,
-                    conversation=conversation,
-                    user_message=user_message,
+                    subjects=subjects,
                     assistant_message_id=assistant_message.id,
                     input_text=normalized_content,
                     output_text=assistant_content,
                     input_mode=input_mode,
-                    attachments=attachments,
                     knowledge_hits=knowledge_hits,
                     settings=settings,
                     status=assistant_message.status,
@@ -883,13 +966,11 @@ async def stream_message(
                     if record_interaction:
                         _record_interaction(
                             interaction_id=interaction_id,
-                            conversation=conversation,
-                            user_message=user_message,
+                            subjects=subjects,
                             assistant_message_id=None,
                             input_text=normalized_content,
                             output_text=partial_content,
                             input_mode=input_mode,
-                            attachments=attachments,
                             knowledge_hits=knowledge_hits,
                             settings=settings,
                             status="interrupted",
@@ -903,7 +984,7 @@ async def stream_message(
                         )
                     recovery = asyncio.create_task(
                         _save_interrupted_message(
-                            conversation_id=conversation.id,
+                            conversation_id=subjects.conversation_id,
                             content=partial_content,
                         )
                     )
@@ -913,8 +994,8 @@ async def stream_message(
                         pass
                 elif record_interaction:
                     _schedule_disconnect_recovery(
-                        conversation_id=conversation.id,
-                        user_message_id=user_message.id,
+                        conversation_id=subjects.conversation_id,
+                        user_message_id=subjects.user_message_id,
                         input_mode=input_mode,
                         interaction_id=interaction_id,
                         started=started,

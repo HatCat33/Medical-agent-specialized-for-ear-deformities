@@ -6,25 +6,44 @@ from fastapi import APIRouter, Depends, File, Header, HTTPException, Response, U
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
+from starlette.types import Receive, Scope, Send
 
 from medical_agent.api.dependencies import current_owner_id
+from medical_agent.core.cleanup import complete_cleanup
 from medical_agent.core.config import get_settings
 from medical_agent.core.database import get_db
 from medical_agent.modules.speech.schemas import TranscriptionRead
 from medical_agent.modules.speech.service import transcribe_audio
 from medical_agent.modules.speech.synthesis import open_synthesis_stream, synthesize
 from medical_agent.modules.system.schemas import PublicSpeechSettings, SynthesisRequest
-from medical_agent.modules.system.speech_service import read_settings
+from medical_agent.modules.system.speech_service import read_settings_cached
 
 router = APIRouter(prefix="/speech", tags=["speech"])
 OwnerId = Annotated[str, Depends(current_owner_id)]
+
+
+class SynthesisStreamingResponse(StreamingResponse):
+    """Release the pre-opened TTS stream even when sending headers/body fails.
+
+    Starlette's normal background callback runs only after successful streaming.
+    Taking ownership here covers disconnects before the first iterator read too.
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        cleanup = self.background
+        self.background = None
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if cleanup is not None:
+                await complete_cleanup(cleanup())
 
 
 @router.get("/settings", response_model=PublicSpeechSettings)
 async def public_speech_settings(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> PublicSpeechSettings:
-    preferences = await read_settings(db)
+    preferences = await read_settings_cached(db)
     settings = get_settings()
     return PublicSpeechSettings(
         **preferences.model_dump(),
@@ -46,11 +65,12 @@ async def create_synthesis(
     if not x_visitor_id or not x_visitor_id.strip():
         raise HTTPException(401, "visitor_required")
     del owner_id
-    preferences = await read_settings(db)
-    settings = get_settings()
-    audio = await synthesize(payload.text, preferences, settings)
-    media_type = "audio/wav" if settings.tts_protocol == "local-sherpa" else "audio/mpeg"
-    return Response(content=audio, media_type=media_type, headers={"Cache-Control": "no-store"})
+    preferences = await read_settings_cached(db)
+    # Synthesis can outlive an ordinary request by tens of seconds. The setting
+    # snapshot is complete, so return the database connection before cloud I/O.
+    await db.close()
+    audio = await synthesize(payload.text, preferences, get_settings())
+    return Response(content=audio, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
 
 
 @router.post("/syntheses/stream")
@@ -64,8 +84,12 @@ async def create_streaming_synthesis(
         raise HTTPException(401, "visitor_required")
     del owner_id
     settings = get_settings()
-    stream = await open_synthesis_stream(payload.text, await read_settings(db), settings)
-    return StreamingResponse(
+    preferences = await read_settings_cached(db)
+    # StreamingResponse keeps yield dependencies alive until audio completes.
+    # Close explicitly so each TTS segment does not pin a PostgreSQL connection.
+    await db.close()
+    stream = await open_synthesis_stream(payload.text, preferences, settings)
+    return SynthesisStreamingResponse(
         stream.iter_bytes(),
         media_type="application/octet-stream",
         background=BackgroundTask(stream.close),

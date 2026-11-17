@@ -1,4 +1,5 @@
 import type {
+  Announcement,
   Conversation,
   ConversationDetail,
   InputMode,
@@ -40,6 +41,16 @@ function visitorId(): string {
     localStorage.setItem(VISITOR_KEY, value);
   }
   return value;
+}
+
+export async function currentUserReference(): Promise<string> {
+  const encoded = new TextEncoder().encode(visitorId());
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encoded));
+  return Array.from(digest.slice(0, 8), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+export function formatUserReference(value: string): string {
+  return value.toUpperCase().match(/.{1,4}/g)?.join("-") ?? value.toUpperCase();
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -100,6 +111,12 @@ interface StreamPayload {
   content?: string;
 }
 
+function clientRequestId(): string {
+  return typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 async function streamMessage(
   conversationId: string,
   content: string,
@@ -118,6 +135,7 @@ async function streamMessage(
       content,
       attachment_ids: attachmentIds,
       input_mode: inputMode,
+      client_request_id: clientRequestId(),
     }),
     signal,
   });
@@ -161,6 +179,12 @@ async function streamMessage(
       buffer = buffer.slice(boundary + 2);
       boundary = buffer.indexOf("\n\n");
     }
+    // `done` is the application-level terminal event. Do not keep the composer
+    // locked while waiting for a proxy or server to close the HTTP body.
+    if (completed) {
+      await reader.cancel().catch(() => undefined);
+      return;
+    }
     if (done) break;
   }
   if (buffer.trim()) processEvent(buffer);
@@ -168,6 +192,7 @@ async function streamMessage(
 }
 
 export const api = {
+  listAnnouncements: () => request<Announcement[]>("/announcements"),
   wecomJsSdkConfiguration: (url: string) =>
     request<WeComJsSdkConfiguration>(`/channels/wecom-h5/js-sdk-config?url=${encodeURIComponent(url)}`),
   synthesizeSpeech: async (text: string, signal: AbortSignal): Promise<Blob> => {
@@ -213,7 +238,7 @@ export const api = {
   sendMessage: (conversationId: string, content: string) =>
     request<SendMessageResponse>(`/conversations/${conversationId}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, client_request_id: clientRequestId() }),
     }),
   streamMessage,
 };

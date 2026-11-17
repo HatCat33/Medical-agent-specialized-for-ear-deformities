@@ -3,6 +3,8 @@ export interface AudioRecordingController {
   cancel: () => void;
 }
 
+export type RecordingCue = "start" | "stop";
+
 const MIME_TYPE_CANDIDATES = [
   "audio/webm;codecs=opus",
   "audio/webm",
@@ -26,6 +28,37 @@ export function audioRecordingSupported(): boolean {
     typeof MediaRecorder !== "undefined" &&
     typeof navigator.mediaDevices?.getUserMedia === "function"
   );
+}
+
+export async function playRecordingCue(cue: RecordingCue): Promise<void> {
+  if (typeof AudioContext === "undefined") return;
+  let context: AudioContext | null = null;
+  try {
+    context = new AudioContext();
+    await context.resume();
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    const startedAt = context.currentTime;
+    const duration = cue === "start" ? 0.09 : 0.07;
+
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(cue === "start" ? 720 : 480, startedAt);
+    gain.gain.setValueAtTime(0.0001, startedAt);
+    gain.gain.exponentialRampToValueAtTime(0.045, startedAt + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startedAt + duration);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+
+    await new Promise<void>((resolve) => {
+      oscillator.onended = () => resolve();
+      oscillator.start(startedAt);
+      oscillator.stop(startedAt + duration);
+    });
+  } catch {
+    // Recording remains available when a browser blocks nonessential cue audio.
+  } finally {
+    if (context && context.state !== "closed") await context.close().catch(() => undefined);
+  }
 }
 
 export async function startAudioRecording(onLevel?: (level: number) => void): Promise<AudioRecordingController> {
@@ -115,6 +148,7 @@ export async function startAudioRecording(onLevel?: (level: number) => void): Pr
   };
 
   try {
+    await playRecordingCue("start");
     recorder.start(250);
   } catch (error) {
     releaseStream();

@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 import httpx
 
 from medical_agent.core.config import Settings
+from medical_agent.core.redis import stable_hash, store
 
 JsonObject = dict[str, Any]
 _TOKEN_ERRORS = {40014, 42001, 42007}
@@ -55,8 +56,15 @@ class WeChatKfClient:
         self._access_token = ""
         self._access_token_expires_at = 0.0
         self._token_lock = asyncio.Lock()
+        self._token_cache_key = store.key(
+            "wechat-kf",
+            stable_hash(self._base_url, self._corp_id, self._secret),
+            "access-token",
+        )
 
     async def _get_access_token(self, *, force: bool = False) -> str:
+        if force:
+            await store.delete(self._token_cache_key)
         if not force and self._access_token and time.monotonic() < self._access_token_expires_at:
             return self._access_token
         async with self._token_lock:
@@ -66,6 +74,12 @@ class WeChatKfClient:
                 and time.monotonic() < self._access_token_expires_at
             ):
                 return self._access_token
+            if not force:
+                cached = await store.get_bytes(self._token_cache_key)
+                if cached:
+                    self._access_token = cached.decode("utf-8")
+                    self._access_token_expires_at = time.monotonic() + 60
+                    return self._access_token
             try:
                 async with httpx.AsyncClient(
                     timeout=self._timeout,
@@ -85,7 +99,13 @@ class WeChatKfClient:
             expires_in = payload.get("expires_in")
             lifetime = int(expires_in) if isinstance(expires_in, int | float) else 7200
             self._access_token = token
-            self._access_token_expires_at = time.monotonic() + max(60, lifetime - 300)
+            ttl = max(60, lifetime - 300)
+            self._access_token_expires_at = time.monotonic() + ttl
+            await store.set_bytes(
+                self._token_cache_key,
+                token.encode(),
+                ttl_seconds=ttl,
+            )
             return token
 
     async def _post(self, endpoint: str, payload: JsonObject) -> JsonObject:

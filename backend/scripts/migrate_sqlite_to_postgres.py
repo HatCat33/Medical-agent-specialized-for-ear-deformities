@@ -10,21 +10,19 @@ import asyncio
 import sqlite3
 import tempfile
 from datetime import UTC, datetime
-from importlib import import_module
 from pathlib import Path
 
 from sqlalchemy import func, inspect, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from medical_agent.core.config import get_settings
-from medical_agent.core.database import Base
+from medical_agent.core.database import Base, load_model_metadata
 
 
 async def migrate(source: Path, *, apply: bool) -> None:
     if not source.is_file():
         raise ValueError("SQLite source does not exist")
-    for module in ("conversation", "knowledge", "media", "system"):
-        import_module(f"medical_agent.modules.{module}.models")
+    load_model_metadata()
     target_url = get_settings().database_url
     if not target_url.startswith("postgresql+asyncpg://"):
         raise ValueError("Set DATABASE_URL to a postgresql+asyncpg destination first")

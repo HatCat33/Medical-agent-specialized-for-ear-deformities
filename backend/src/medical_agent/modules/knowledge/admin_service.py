@@ -26,6 +26,7 @@ from medical_agent.modules.knowledge.models import (
     KnowledgeRelease,
 )
 from medical_agent.modules.knowledge.schemas import FaqEntryInput
+from medical_agent.providers.embedding.client import embedding_fingerprint
 
 logger = get_logger(__name__)
 
@@ -71,9 +72,7 @@ async def require_release(
 
 
 def fingerprint(settings: Settings) -> str:
-    return hashlib.sha256(
-        f"{settings.embedding_base_url.rstrip('/')}|{settings.embedding_model}".encode()
-    ).hexdigest()
+    return embedding_fingerprint(settings)
 
 
 async def release_view(db: AsyncSession, release: KnowledgeRelease) -> dict[str, Any]:
@@ -125,6 +124,61 @@ def entry_view(entry: KnowledgeEntry) -> dict[str, Any]:
         "vectorized": bool(entry.embedding_json),
         "chunk_text": service.embedding_text(entry),
     }
+
+
+IMPORT_FIELDS = ("category", "question", "aliases", "answer", "effective_date")
+
+
+def entries_checksum(entries: list[KnowledgeEntry]) -> str:
+    snapshot = [
+        [entry.id, *(getattr(entry, field) for field in IMPORT_FIELDS)]
+        for entry in sorted(entries, key=lambda item: item.id)
+    ]
+    return hashlib.sha256(
+        json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def import_preview(
+    incoming: list[FaqEntryInput], existing: list[KnowledgeEntry]
+) -> dict[str, Any]:
+    """Classify workbook rows without changing the draft."""
+    by_question = {service.question_key(entry.question): entry for entry in existing}
+    incoming_groups: dict[str, list[FaqEntryInput]] = {}
+    for item in incoming:
+        incoming_groups.setdefault(service.question_key(item.question), []).append(item)
+
+    counts = {"added": 0, "updated": 0, "unchanged": 0, "conflict": 0}
+    rows: list[dict[str, Any]] = []
+    for item in incoming:
+        key = service.question_key(item.question)
+        current = by_question.get(key)
+        changed_fields = [
+            field
+            for field in IMPORT_FIELDS
+            if current is not None and getattr(current, field) != getattr(item, field)
+        ]
+        if len(incoming_groups[key]) > 1:
+            kind = "conflict"
+        elif current is None:
+            kind = "added"
+        elif changed_fields:
+            kind = "updated"
+        else:
+            kind = "unchanged"
+        counts[kind] += 1
+        rows.append(
+            {
+                "key": f"row-{item.source_row}",
+                "source_row": item.source_row,
+                "kind": kind,
+                "conflict_rows": [row.source_row for row in incoming_groups[key]],
+                "changed_fields": changed_fields,
+                "incoming": {field: getattr(item, field) for field in IMPORT_FIELDS},
+                "existing": entry_view(current) if current is not None else None,
+            }
+        )
+    return {"counts": counts, "rows": rows, "draft_checksum": entries_checksum(existing)}
 
 
 async def create_draft(
@@ -261,6 +315,18 @@ async def merge_entries(
     audit(db, release_id, "xlsx_merged", source_name=source_name, checksum=checksum, **counts)
     await db.commit()
     return counts
+
+
+async def preview_entries(
+    db: AsyncSession, release_id: str, incoming: list[FaqEntryInput]
+) -> dict[str, Any]:
+    await require_release(db, release_id, draft=True, idle=True)
+    existing = list(
+        await db.scalars(
+            select(KnowledgeEntry).where(KnowledgeEntry.release_id == release_id)
+        )
+    )
+    return import_preview(incoming, existing)
 
 
 async def publish(db: AsyncSession, release_id: str) -> None:

@@ -11,6 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from medical_agent.core.config import Settings
+from medical_agent.core.redis import stable_hash, store
 
 
 class WeComH5Error(RuntimeError):
@@ -82,6 +83,12 @@ class WeComH5Signer:
             now = time.monotonic()
             if self._ticket.value and self._ticket.expires_at > now:
                 return self._ticket.value
+            cache_key = self._cache_key(settings, "jsapi-ticket")
+            cached = await store.get_bytes(cache_key)
+            if cached:
+                ticket = cached.decode("utf-8")
+                self._ticket = CachedValue(ticket, now + 60)
+                return ticket
             token = await self._access_token(settings)
             payload = await self._get(
                 settings,
@@ -91,13 +98,21 @@ class WeComH5Signer:
             ticket = payload.get("ticket")
             if not isinstance(ticket, str) or not ticket:
                 raise WeComH5Error("wecom_h5_ticket_invalid")
-            self._ticket = CachedValue(ticket, now + self._ttl(payload))
+            ttl = self._ttl(payload)
+            self._ticket = CachedValue(ticket, now + ttl)
+            await store.set_bytes(cache_key, ticket.encode(), ttl_seconds=int(ttl))
             return ticket
 
     async def _access_token(self, settings: Settings) -> str:
         now = time.monotonic()
         if self._token.value and self._token.expires_at > now:
             return self._token.value
+        cache_key = self._cache_key(settings, "access-token")
+        cached = await store.get_bytes(cache_key)
+        if cached:
+            token = cached.decode("utf-8")
+            self._token = CachedValue(token, now + 60)
+            return token
         payload = await self._get(
             settings,
             "/cgi-bin/gettoken",
@@ -106,7 +121,9 @@ class WeComH5Signer:
         token = payload.get("access_token")
         if not isinstance(token, str) or not token:
             raise WeComH5Error("wecom_h5_token_invalid")
-        self._token = CachedValue(token, now + self._ttl(payload))
+        ttl = self._ttl(payload)
+        self._token = CachedValue(token, now + ttl)
+        await store.set_bytes(cache_key, token.encode(), ttl_seconds=int(ttl))
         return token
 
     async def _agent_jsapi_ticket(self, settings: Settings) -> str:
@@ -117,6 +134,12 @@ class WeComH5Signer:
             now = time.monotonic()
             if self._agent_ticket.value and self._agent_ticket.expires_at > now:
                 return self._agent_ticket.value
+            cache_key = self._cache_key(settings, "agent-ticket")
+            cached = await store.get_bytes(cache_key)
+            if cached:
+                ticket = cached.decode("utf-8")
+                self._agent_ticket = CachedValue(ticket, now + 60)
+                return ticket
             token = await self._access_token(settings)
             payload = await self._get(
                 settings,
@@ -126,8 +149,20 @@ class WeComH5Signer:
             ticket = payload.get("ticket")
             if not isinstance(ticket, str) or not ticket:
                 raise WeComH5Error("wecom_h5_agent_ticket_invalid")
-            self._agent_ticket = CachedValue(ticket, now + self._ttl(payload))
+            ttl = self._ttl(payload)
+            self._agent_ticket = CachedValue(ticket, now + ttl)
+            await store.set_bytes(cache_key, ticket.encode(), ttl_seconds=int(ttl))
             return ticket
+
+    @staticmethod
+    def _cache_key(settings: Settings, kind: str) -> str:
+        credential = stable_hash(
+            settings.wecom_h5_api_base_url.rstrip("/"),
+            settings.wecom_corp_id,
+            settings.wecom_agent_id,
+            settings.wecom_secret,
+        )
+        return store.key("wecom-h5", credential, kind)
 
     async def _get(
         self,

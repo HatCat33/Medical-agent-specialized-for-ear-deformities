@@ -106,7 +106,7 @@ async def transcribe_audio_bytes(
             audio_bytes=len(data),
             duration_ms=round((time.perf_counter() - started_at) * 1000),
         )
-        unavailable = code == "asr_not_configured"
+        unavailable = code in {"asr_not_configured", "asr_capacity_exhausted"}
         raise HTTPException(
             status_code=(
                 status.HTTP_503_SERVICE_UNAVAILABLE if unavailable else status.HTTP_502_BAD_GATEWAY

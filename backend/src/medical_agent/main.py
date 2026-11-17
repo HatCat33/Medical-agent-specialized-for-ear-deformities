@@ -8,9 +8,14 @@ from medical_agent.core.config import get_settings
 from medical_agent.core.database import close_db, init_db
 from medical_agent.core.logging import configure_logging
 from medical_agent.core.middleware import RequestContextMiddleware
+from medical_agent.core.redis import close_redis, init_redis
 from medical_agent.modules.channels.wechat_kf.service import runtime as wechat_kf_runtime
 from medical_agent.modules.channels.wecom.service import runtime as wecom_runtime
 from medical_agent.modules.speech.synthesis import close_synthesis_clients
+from medical_agent.providers.embedding.client import close_embedding_clients
+from medical_agent.providers.llm.client import close_chat_clients
+from medical_agent.providers.rerank.client import close_reranker_clients
+from medical_agent.providers.speech.client import close_speech_clients
 
 
 @asynccontextmanager
@@ -32,10 +37,7 @@ async def lifespan(_: FastAPI):
             .values(status="interrupted", active_slot=None, error="server_restarted_retry_required")
         )
         await db.commit()
-    if get_settings().tts_protocol == "local-sherpa":
-        from medical_agent.modules.speech.local_tts import warm_local_tts
-
-        await warm_local_tts(get_settings())
+    await init_redis(get_settings())
     await wecom_runtime.start(get_settings())
     await wechat_kf_runtime.start(get_settings())
     try:
@@ -43,7 +45,12 @@ async def lifespan(_: FastAPI):
     finally:
         await wechat_kf_runtime.stop()
         await wecom_runtime.stop()
+        await close_chat_clients()
+        await close_embedding_clients()
+        await close_speech_clients()
+        await close_reranker_clients()
         await close_synthesis_clients()
+        await close_redis()
         await close_db()
 
 
@@ -52,15 +59,17 @@ def create_app() -> FastAPI:
     configure_logging(
         level=settings.log_level,
         json_logs=settings.log_json,
-        file_path=settings.log_file_path,
+        file_path=settings.resolved_log_file_path,
         max_bytes=settings.log_max_bytes,
-        backup_count=settings.log_backup_count,
+        log_timezone=settings.log_timezone,
+        log_retention_days=settings.log_retention_days,
         interaction_enabled=settings.interaction_log_enabled,
-        interaction_file_path=settings.interaction_log_file_path,
+        interaction_file_path=settings.resolved_interaction_log_file_path,
         interaction_max_bytes=settings.interaction_log_max_bytes,
-        interaction_backup_count=settings.interaction_log_backup_count,
+        interaction_timezone=settings.interaction_log_timezone,
+        interaction_retention_days=settings.interaction_log_retention_days,
     )
-    app = FastAPI(title="Medical Agent API", version="0.4.0", lifespan=lifespan)
+    app = FastAPI(title="Medical Agent API", version="0.5.0", lifespan=lifespan)
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(
         CORSMiddleware,

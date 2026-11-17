@@ -1,2 +1,0 @@
-"""Reranker provider protocol."""
-

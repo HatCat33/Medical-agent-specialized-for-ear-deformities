@@ -99,6 +99,8 @@ def _cards(settings: Settings) -> list[dict[str, Any]]:
                 "max_tokens": settings.llm_max_tokens,
                 "thinking": settings.llm_enable_thinking,
                 "retry_count": settings.llm_retry_count,
+                "concurrency_limit": settings.model_concurrency_limit,
+                "concurrency_wait_seconds": settings.model_concurrency_wait_seconds,
             },
         },
         {
@@ -133,6 +135,8 @@ def _cards(settings: Settings) -> list[dict[str, Any]]:
                 "timeout_seconds": settings.llm_timeout_seconds,
                 "max_tokens": settings.vision_max_tokens,
                 "thinking": settings.vision_enable_thinking,
+                "concurrency_limit": settings.vision_concurrency_limit,
+                "concurrency_wait_seconds": settings.vision_concurrency_wait_seconds,
             },
         },
         {
@@ -147,6 +151,8 @@ def _cards(settings: Settings) -> list[dict[str, Any]]:
             "settings": {
                 "timeout_seconds": settings.asr_timeout_seconds,
                 "language": settings.asr_language,
+                "concurrency_limit": settings.asr_concurrency_limit,
+                "concurrency_wait_seconds": settings.asr_concurrency_wait_seconds,
             },
         },
         {
@@ -164,6 +170,7 @@ def _cards(settings: Settings) -> list[dict[str, Any]]:
             "settings": {
                 "timeout_seconds": settings.embedding_timeout_seconds,
                 "batch_size": settings.embedding_batch_size,
+                "dimensions": settings.embedding_dimensions,
             },
         },
         {
@@ -182,6 +189,8 @@ def _cards(settings: Settings) -> list[dict[str, Any]]:
                 "enabled": settings.reranker_enabled,
                 "timeout_seconds": settings.reranker_timeout_seconds,
                 "candidate_k": settings.reranker_candidate_k,
+                "concurrency_limit": settings.reranker_concurrency_limit,
+                "concurrency_wait_seconds": settings.reranker_concurrency_wait_seconds,
             },
         },
         {
@@ -189,8 +198,8 @@ def _cards(settings: Settings) -> list[dict[str, Any]]:
             "label": "云端语音合成",
             "provider": settings.tts_protocol,
             "model": effective_model(settings),
-            "endpoint_host": "本机 CPU" if settings.tts_protocol == "local-sherpa" else _host(settings.tts_base_url),
-            "api_key_configured": settings.tts_protocol != "local-sherpa" and bool(settings.tts_api_key),
+            "endpoint_host": _host(settings.tts_base_url),
+            "api_key_configured": bool(settings.tts_api_key),
             "configured": is_configured(settings),
             "client_only": False,
             "settings": {},
@@ -235,7 +244,8 @@ async def model_inventory(db: AsyncSession, settings: Settings) -> dict[str, Any
             "streaming_enabled": settings.tts_streaming_enabled,
             "stream_sample_rate": settings.tts_stream_sample_rate,
             "stream_channels": settings.tts_stream_channels,
-            "local_threads": settings.tts_local_threads,
+            "concurrency_limit": settings.tts_concurrency_limit,
+            "concurrency_wait_seconds": settings.tts_concurrency_wait_seconds,
         },
         active=speech.provider == "openai-compatible",
     )

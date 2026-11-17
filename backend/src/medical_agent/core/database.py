@@ -2,20 +2,56 @@
 
 from collections.abc import AsyncIterator
 from importlib import import_module
+from typing import Any
 
 from sqlalchemy import Connection, inspect
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
-from medical_agent.core.config import get_settings
+from medical_agent.core.config import Settings, get_settings
 
 
 class Base(DeclarativeBase):
     pass
 
 
+MODEL_MODULES = (
+    "medical_agent.modules.announcements.models",
+    "medical_agent.modules.conversation.models",
+    "medical_agent.modules.channels.common.models",
+    "medical_agent.modules.knowledge.models",
+    "medical_agent.modules.media.models",
+    "medical_agent.modules.system.models",
+)
+
+
+def load_model_metadata() -> None:
+    """Import every ORM module before schema inspection or data migration."""
+    for module in MODEL_MODULES:
+        import_module(module)
+
+
+def database_engine_options(settings: Settings) -> dict[str, Any]:
+    """Return runtime engine options supported by the configured database."""
+    options: dict[str, Any] = {"echo": False}
+    if make_url(settings.database_url).get_backend_name() != "postgresql":
+        return options
+
+    # QueuePool limits are intentionally PostgreSQL-only. Increasing an SQLite
+    # pool adds writers but cannot remove SQLite's database-wide write lock.
+    options.update(
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+        pool_timeout=settings.database_pool_timeout_seconds,
+        pool_recycle=settings.database_pool_recycle_seconds,
+        pool_pre_ping=settings.database_pool_pre_ping,
+    )
+    return options
+
+
 settings = get_settings()
-engine = create_async_engine(settings.database_url, echo=False)
+engine = create_async_engine(settings.database_url, **database_engine_options(settings))
 session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 
@@ -25,12 +61,7 @@ async def get_db() -> AsyncIterator[AsyncSession]:
 
 
 async def init_db() -> None:
-    # Import models here so SQLAlchemy sees them before creating development tables.
-    import_module("medical_agent.modules.conversation.models")
-    import_module("medical_agent.modules.channels.common.models")
-    import_module("medical_agent.modules.knowledge.models")
-    import_module("medical_agent.modules.media.models")
-    import_module("medical_agent.modules.system.models")
+    load_model_metadata()
 
     def verify_existing_schema(connection: Connection) -> None:
         inspector = inspect(connection)

@@ -60,6 +60,7 @@ class SendMessageRequest(BaseModel):
     content: str = Field(default="", max_length=4000)
     attachment_ids: list[str] = Field(default_factory=list, max_length=4)
     input_mode: Literal["text", "voice", "multimodal"] = "text"
+    client_request_id: str | None = Field(default=None, min_length=8, max_length=100)
 
     @model_validator(mode="after")
     def validate_content_or_attachments(self) -> "SendMessageRequest":

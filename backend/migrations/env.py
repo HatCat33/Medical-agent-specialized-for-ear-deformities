@@ -1,17 +1,15 @@
 """Async Alembic environment; uses DATABASE_URL without printing credentials."""
 
 import asyncio
-from importlib import import_module
 
 from alembic import context
 from sqlalchemy import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from medical_agent.core.config import get_settings
-from medical_agent.core.database import Base
+from medical_agent.core.database import Base, load_model_metadata
 
-for module in ("conversation", "knowledge", "media", "system"):
-    import_module(f"medical_agent.modules.{module}.models")
+load_model_metadata()
 
 
 def migrate(connection: Connection) -> None:

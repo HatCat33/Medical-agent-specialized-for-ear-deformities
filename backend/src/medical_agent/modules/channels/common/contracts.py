@@ -13,7 +13,7 @@ class EncryptedRemoteImage:
 
 @dataclass(frozen=True)
 class InboundMessage:
-    channel: Literal["wecom", "feishu", "wechat_kf"]
+    channel: Literal["wecom", "wechat_kf"]
     event_id: str
     request_id: str
     bot_id: str

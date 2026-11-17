@@ -272,6 +272,7 @@ async def retrieve_context(
 def citation_markdown(hits: list[RetrievalHit]) -> str:
     if not hits:
         return ""
-    lines = ["\n\n参考资料："]
-    lines.extend(f"- [{index}] {hit.citation_label}" for index, hit in enumerate(hits, start=1))
-    return "\n".join(lines)
+    # lines = ["\n\n参考资料："]
+    # lines.extend(f"- [{index}] {hit.citation_label}" for index, hit in enumerate(hits, start=1))
+    # return "\n".join(lines)
+    return ""

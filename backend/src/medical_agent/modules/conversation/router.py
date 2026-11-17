@@ -1,10 +1,11 @@
 """Conversation, message, and history endpoints."""
 
 import json
+import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +13,7 @@ from medical_agent.api.dependencies import current_owner_id
 from medical_agent.core.config import get_settings
 from medical_agent.core.database import get_db
 from medical_agent.core.logging import get_logger
+from medical_agent.core.redis import store
 from medical_agent.modules.conversation import repository, service
 from medical_agent.modules.conversation.models import Message
 from medical_agent.modules.conversation.schemas import (
@@ -28,6 +30,35 @@ router = APIRouter(prefix="/conversations", tags=["conversations"])
 logger = get_logger(__name__)
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 OwnerId = Annotated[str, Depends(current_owner_id)]
+
+
+async def _enforce_chat_rate_limit(owner_id: str) -> None:
+    settings = get_settings()
+    allowed, retry_after = await store.allow_request(
+        scope="chat",
+        subject=owner_id,
+        limit=settings.chat_rate_limit_requests,
+        window_seconds=settings.chat_rate_limit_window_seconds,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="chat_rate_limit_exceeded",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+async def _claim_message(owner_id: str, payload: SendMessageRequest) -> None:
+    if payload.client_request_id is None:
+        return
+    settings = get_settings()
+    key = store.key(
+        "idempotency",
+        "chat",
+        service.request_identity(owner_id, payload.client_request_id),
+    )
+    if not await store.claim_once(key, ttl_seconds=settings.chat_idempotency_ttl_seconds):
+        raise HTTPException(status_code=409, detail="duplicate_message_request")
 
 
 @router.get("", response_model=list[ConversationRead])
@@ -71,7 +102,7 @@ async def get_conversation(
     return ConversationDetail(
         **ConversationRead.model_validate(conversation).model_dump(),
         messages=[MessageRead.model_validate(message) for message in messages],
-        generation_pending=service.is_generation_pending(conversation.id),
+        generation_pending=await service.is_generation_pending(conversation.id),
     )
 
 
@@ -82,18 +113,26 @@ async def send_message(
     db: DbSession,
     owner_id: OwnerId,
 ) -> SendMessageResponse:
+    await _enforce_chat_rate_limit(owner_id)
+    await _claim_message(owner_id, payload)
     conversation = await service.require_conversation(
         db,
         conversation_id=conversation_id,
         owner_id=owner_id,
     )
-    user_message, assistant_message = await service.send_message(
-        db,
-        conversation=conversation,
-        content=payload.content,
-        attachment_ids=payload.attachment_ids,
-        input_mode=payload.input_mode,
-    )
+    generation_key = store.key("generation", conversation.id)
+    generation_token = uuid.uuid4().hex
+    await store.set_bytes(generation_key, generation_token.encode(), ttl_seconds=600)
+    try:
+        user_message, assistant_message = await service.send_message(
+            db,
+            conversation=conversation,
+            content=payload.content,
+            attachment_ids=payload.attachment_ids,
+            input_mode=payload.input_mode,
+        )
+    finally:
+        await store.delete_if_value(generation_key, generation_token)
     return SendMessageResponse(
         conversation=ConversationRead.model_validate(conversation),
         user_message=MessageRead.model_validate(user_message),
@@ -108,6 +147,8 @@ async def stream_message(
     db: DbSession,
     owner_id: OwnerId,
 ) -> StreamingResponse:
+    await _enforce_chat_rate_limit(owner_id)
+    await _claim_message(owner_id, payload)
     conversation = await service.require_conversation(
         db,
         conversation_id=conversation_id,
@@ -115,6 +156,9 @@ async def stream_message(
     )
 
     async def event_stream() -> AsyncIterator[str]:
+        generation_key = store.key("generation", conversation.id)
+        generation_token = uuid.uuid4().hex
+        await store.set_bytes(generation_key, generation_token.encode(), ttl_seconds=600)
         try:
             async for event, value in service.stream_message(
                 db,
@@ -144,6 +188,8 @@ async def stream_message(
                 separators=(",", ":"),
             )
             yield f"event: error\ndata: {encoded}\n\n"
+        finally:
+            await store.delete_if_value(generation_key, generation_token)
 
     return StreamingResponse(
         event_stream(),

@@ -1,2 +1,0 @@
-"""Typed online workflow state."""
-

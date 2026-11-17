@@ -1,7 +1,7 @@
 {
   "name": "@medical-agent/admin-web",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "dev": "vite --port 5174",
@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.0.0",
+    "@uiw/react-md-editor": "^4.2.3",
     "antd": "^5.22.0",
     "lucide-react": "^0.468.0",
     "react": "^19.0.0",
@@ -30,4 +31,3 @@
     "vitest": "^2.1.0"
   }
 }
-

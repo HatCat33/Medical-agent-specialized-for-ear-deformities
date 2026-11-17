@@ -1,16 +1,48 @@
 """OpenAI-compatible speech-to-text provider."""
 
+import asyncio
 import json
 from typing import cast
 
 import httpx
 
 from medical_agent.core.config import Settings
+from medical_agent.core.redis import capacity_slot
 from medical_agent.providers.speech.protocol import AudioInput, SpeechToTextProvider
+
+_clients: dict[tuple[str, float, int, int], httpx.AsyncClient] = {}
+_client_lock = asyncio.Lock()
 
 
 class SpeechProviderError(RuntimeError):
     pass
+
+
+async def _client_for(
+    base_url: str,
+    timeout: float,
+    transport: httpx.AsyncBaseTransport | None,
+) -> httpx.AsyncClient:
+    key = (base_url.rstrip("/"), timeout, id(transport), id(httpx.AsyncClient))
+    existing = _clients.get(key)
+    if existing is not None:
+        return existing
+    async with _client_lock:
+        existing = _clients.get(key)
+        if existing is None:
+            existing = httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                transport=transport,
+            )
+            _clients[key] = existing
+        return existing
+
+
+async def close_speech_clients() -> None:
+    clients = list(_clients.values())
+    _clients.clear()
+    await asyncio.gather(*(client.aclose() for client in clients), return_exceptions=True)
 
 
 class OpenAICompatibleSpeechProvider:
@@ -25,6 +57,7 @@ class OpenAICompatibleSpeechProvider:
         self.model = settings.asr_model
         self.language = settings.asr_language.strip()
         self.timeout = settings.asr_timeout_seconds
+        self.settings = settings
         self.transport = transport
 
     async def transcribe(self, audio: AudioInput) -> str:
@@ -35,10 +68,14 @@ class OpenAICompatibleSpeechProvider:
         if self.language:
             form["language"] = self.language
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout,
-                transport=self.transport,
-            ) as client:
+            client = await _client_for(self.base_url, self.timeout, self.transport)
+            async with capacity_slot(
+                self.settings,
+                scope="asr-model",
+                limit=self.settings.asr_concurrency_limit,
+                wait_seconds=self.settings.asr_concurrency_wait_seconds,
+                lease_seconds=max(30, int(self.timeout) + 30),
+            ):
                 response = await client.post(
                     f"{self.base_url}/audio/transcriptions",
                     headers={"Authorization": f"Bearer {self.api_key}"},
@@ -46,6 +83,8 @@ class OpenAICompatibleSpeechProvider:
                     files={"file": (audio.filename, audio.data, audio.media_type)},
                 )
                 response.raise_for_status()
+        except TimeoutError as exc:
+            raise SpeechProviderError("asr_capacity_exhausted") from exc
         except httpx.HTTPError as exc:
             raise SpeechProviderError("asr_request_failed") from exc
 

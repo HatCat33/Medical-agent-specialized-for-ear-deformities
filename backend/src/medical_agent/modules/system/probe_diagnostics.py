@@ -75,27 +75,6 @@ def failure_detail(exc: Exception, kind: str, settings: Settings) -> dict[str, A
                 "seed-tts-2.0 需使用已授权的 2.0 音色；1.0 音色需改用匹配的资源 ID。"
             ),
         )
-    elif kind == "tts" and settings.tts_protocol == "local-sherpa":
-        missing = []
-        if code == "tts_not_configured":
-            code = "tts_local_model_missing"
-        category, summary, advice = {
-            "tts_local_model_missing": (
-                "configuration", "本地语音模型文件缺失",
-                "在 backend 目录执行 uv run --extra local-tts python scripts/setup_local_tts.py，并核对 TTS_LOCAL_MODEL_DIR。",
-            ),
-            "tts_local_dependencies_missing": (
-                "configuration", "本地语音依赖未安装",
-                "在 backend 目录执行 uv sync --extra dev --extra local-tts，并使用 --extra local-tts 启动后端。",
-            ),
-            "tts_local_busy": (
-                "capacity", "本地语音任务正在排队",
-                "等待当前合成结束后重试；核对本机 CPU 负载及 TTS_LOCAL_THREADS。",
-            ),
-        }.get(code, (
-            "response", "本地语音合成失败",
-            "检查本地模型文件、CPU 负载及后端对应请求日志；本地协议无需云端密钥。",
-        ))
     elif code == "model_not_configured" and kind == "reranker" and not settings.reranker_enabled:
         missing = ["RERANKER_ENABLED=true"]
         category, summary, advice = (

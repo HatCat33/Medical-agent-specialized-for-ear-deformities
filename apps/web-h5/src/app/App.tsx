@@ -1,19 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ChatPanel } from "../features/chat/ChatPanel";
+import { AnnouncementCenter } from "../features/announcements/AnnouncementCenter";
 import { useAnswerSpeech } from "../features/chat/useAnswerSpeech";
 import { HistorySidebar } from "../features/history/HistorySidebar";
 import { DeleteConversationDialog } from "../features/history/DeleteConversationDialog";
-import { api } from "../lib/api";
+import { api, currentUserReference, formatUserReference } from "../lib/api";
 import { prepareImageForUpload } from "../lib/image";
 import { ProgressiveTextStream } from "../lib/progressiveStream";
 import {
   audioRecordingSupported,
+  playRecordingCue,
   readableRecordingError,
   startAudioRecording,
   type AudioRecordingController,
 } from "../lib/speech";
 import type {
+  Announcement,
   Conversation,
   InputMode,
   MediaAttachment,
@@ -25,6 +28,7 @@ const MAX_IMAGES = 4;
 const MAX_RECORDING_MS = 60_000;
 const IMAGE_ONLY_QUESTION = "请对上传图片中与耳部健康科普相关的可见信息进行客观说明。";
 const SIDEBAR_COLLAPSED_KEY = "medical-agent-sidebar-collapsed";
+const READ_ANNOUNCEMENTS_KEY = "medical-agent-read-announcements";
 
 interface SubmitOptions {
   content: string;
@@ -68,6 +72,17 @@ export function App() {
   const [transcribing, setTranscribing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [userReference, setUserReference] = useState("");
+  const [announcements, setAnnouncements] = useState<Announcement[]>([]);
+  const [announcementOpen, setAnnouncementOpen] = useState(false);
+  const [selectedAnnouncement, setSelectedAnnouncement] = useState<Announcement | null>(null);
+  const [readAnnouncementIds, setReadAnnouncementIds] = useState<Set<string>>(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem(READ_ANNOUNCEMENTS_KEY) ?? "[]") as string[]);
+    } catch {
+      return new Set();
+    }
+  });
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [deletingConversation, setDeletingConversation] = useState(false);
   const historyOpenRef = useRef(false);
@@ -107,6 +122,48 @@ export function App() {
   useEffect(() => {
     historyOpenRef.current = historyOpen;
   }, [historyOpen]);
+
+  useEffect(() => {
+    let active = true;
+    void currentUserReference()
+      .then((value) => {
+        if (active) setUserReference(formatUserReference(value));
+      })
+      .catch(() => {
+        if (active) setUserReference("暂不可用");
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void api.listAnnouncements().then(items => {
+      if (!active) return;
+      setAnnouncements(items);
+      const read = new Set(JSON.parse(localStorage.getItem(READ_ANNOUNCEMENTS_KEY) ?? "[]") as string[]);
+      const latestUnread = items.find(item => !read.has(item.id));
+      if (latestUnread) {
+        setSelectedAnnouncement(latestUnread);
+        setAnnouncementOpen(true);
+        read.add(latestUnread.id);
+        localStorage.setItem(READ_ANNOUNCEMENTS_KEY, JSON.stringify([...read]));
+        setReadAnnouncementIds(read);
+      }
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
+  function openAnnouncement(item: Announcement) {
+    setSelectedAnnouncement(item);
+    setAnnouncementOpen(true);
+    setReadAnnouncementIds(current => {
+      const next = new Set(current).add(item.id);
+      localStorage.setItem(READ_ANNOUNCEMENTS_KEY, JSON.stringify([...next]));
+      return next;
+    });
+  }
 
   useEffect(() => {
     let startX = 0;
@@ -469,6 +526,7 @@ export function App() {
     setError(null);
     try {
       const file = await controller.stop();
+      await playRecordingCue("stop");
       if (!file || file.size < 128) {
         setError("录音时间太短，请按住后再说话。");
         return;
@@ -528,6 +586,14 @@ export function App() {
     let assistantTemporaryId = "";
     let presenter: ProgressiveTextStream | null = null;
     const completedMessage: { current: Message | null } = { current: null };
+    let inputReleased = false;
+    const releaseInputAfterText = () => {
+      if (inputReleased || activeTurnRef.current !== turn) return;
+      inputReleased = true;
+      activeTurnRef.current = null;
+      if (streamController.current === controller) streamController.current = null;
+      setSending(false);
+    };
     try {
       if (files.length) uploaded = await api.uploadImages(files);
       const conversation = activeId
@@ -600,24 +666,34 @@ export function App() {
           onDone: (message) => {
             if (activeTurnRef.current !== turn) return;
             completedMessage.current = message;
+            // Text generation and speech playback have independent lifecycles.
+            // Restore the composer as soon as the persisted answer is complete;
+            // queued text animation and audio may continue in the background.
+            playback.finish(turn.id);
+            releaseInputAfterText();
           },
         },
         controller.signal,
       );
-      if (activeTurnRef.current !== turn) {
+      if (!completedMessage.current && activeTurnRef.current !== turn) {
         throw new DOMException("Aborted", "AbortError");
       }
       playback.finish(turn.id);
+      releaseInputAfterText();
       await presenter.finish();
-      if (activeTurnRef.current !== turn || controller.signal.aborted) {
+      if (!completedMessage.current || controller.signal.aborted) {
         throw new DOMException("Aborted", "AbortError");
       }
-      if (!completedMessage.current) throw new Error("stream_ended_without_message");
       setMessages((current) =>
         current.map((item) =>
           item.id === assistantTemporaryId ? completedMessage.current! : item,
         ),
       );
+      try {
+        await refreshConversations();
+      } catch {
+        // The completed message remains usable even if refreshing the sidebar fails.
+      }
     } catch (caught) {
       presenter?.cancel();
       playback.cancel(turn.id);
@@ -683,6 +759,8 @@ export function App() {
         open={historyOpen}
         collapsed={sidebarCollapsed}
         busy={sending || listening || transcribing || processingImages}
+        userReference={userReference}
+        unreadAnnouncements={announcements.filter(item => !readAnnouncementIds.has(item.id)).length}
         onClose={() => setHistoryOpen(false)}
         onToggleCollapsed={() => {
           setSidebarCollapsed((current) => {
@@ -694,6 +772,10 @@ export function App() {
         onCreate={() => void createConversation()}
         onSelect={(conversationId) => void openConversation(conversationId)}
         onDelete={setPendingDeleteId}
+        onOpenAnnouncements={() => {
+          setSelectedAnnouncement(null);
+          setAnnouncementOpen(true);
+        }}
       />
       <button
         className="mobile-history-dismiss"
@@ -765,6 +847,14 @@ export function App() {
             inputMode: selectedImages.length ? "multimodal" : "text",
           });
         }}
+      />
+      <AnnouncementCenter
+        open={announcementOpen}
+        announcements={announcements}
+        selected={selectedAnnouncement}
+        readIds={readAnnouncementIds}
+        onClose={() => setAnnouncementOpen(false)}
+        onSelect={openAnnouncement}
       />
       {pendingDeleteId && (
         <DeleteConversationDialog

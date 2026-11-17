@@ -1,11 +1,14 @@
 """Bounded, ephemeral synthesis through pluggable cloud TTS protocols."""
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
 import time
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
 from xml.sax.saxutils import escape, quoteattr
@@ -13,18 +16,13 @@ from xml.sax.saxutils import escape, quoteattr
 import httpx
 from fastapi import HTTPException
 
+from medical_agent.core.cleanup import complete_cleanup
 from medical_agent.core.config import Settings
 from medical_agent.core.logging import get_logger
-from medical_agent.modules.speech.local_tts import (
-    LocalSynthesisStream,
-    is_local_configured,
-    local_pcm,
-    local_wav,
-)
+from medical_agent.core.redis import capacity_slot, stable_hash, store
 from medical_agent.modules.system.schemas import SpeechSettings
 
 logger = get_logger(__name__)
-_slots = asyncio.Semaphore(4)
 _clients: dict[tuple[str, float, int], httpx.AsyncClient] = {}
 _client_lock = asyncio.Lock()
 _MAX_AUDIO_BYTES = 8 * 1024 * 1024
@@ -109,10 +107,93 @@ class SynthesisStream:
         if self._closed:
             return
         self._closed = True
+        await complete_cleanup(self.response.aclose())
+
+
+class MemorySynthesisStream:
+    """Replay cached PCM without holding a provider connection or capacity slot."""
+
+    def __init__(self, audio: bytes) -> None:
+        self._audio = audio
+
+    async def iter_bytes(self) -> AsyncGenerator[bytes, None]:
+        for offset in range(0, len(self._audio), 32 * 1024):
+            yield self._audio[offset : offset + 32 * 1024]
+
+    async def close(self) -> None:
+        return
+
+
+class CachingSynthesisStream:
+    """Forward PCM immediately and cache it only after a complete upstream stream."""
+
+    def __init__(
+        self,
+        stream: (
+            SynthesisStream
+            | VolcengineSseStream
+            | CapacityManagedSynthesisStream
+        ),
+        *,
+        cache_key: str,
+        ttl_seconds: int,
+    ) -> None:
+        self._stream = stream
+        self._cache_key = cache_key
+        self._ttl_seconds = ttl_seconds
+
+    async def iter_bytes(self) -> AsyncGenerator[bytes, None]:
+        audio = bytearray()
+        completed = False
         try:
-            await self.response.aclose()
+            async for block in self._stream.iter_bytes():
+                if len(audio) + len(block) <= _MAX_AUDIO_BYTES:
+                    audio.extend(block)
+                yield block
+            completed = bool(audio)
         finally:
-            _slots.release()
+            if completed:
+                await store.set_bytes(
+                    self._cache_key,
+                    bytes(audio),
+                    ttl_seconds=self._ttl_seconds,
+                )
+
+    async def close(self) -> None:
+        await self._stream.close()
+
+
+class CapacityManagedSynthesisStream:
+    """Hold a TTS capacity lease until the returned audio stream is closed."""
+
+    def __init__(
+        self,
+        stream: SynthesisStream | VolcengineSseStream,
+        capacity: AbstractAsyncContextManager[None],
+    ) -> None:
+        self._stream = stream
+        self._capacity = capacity
+        self._closed = False
+
+    async def iter_bytes(self) -> AsyncGenerator[bytes, None]:
+        try:
+            async for block in self._stream.iter_bytes():
+                yield block
+        finally:
+            await self.close()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await complete_cleanup(self._release())
+
+    async def _release(self) -> None:
+        # Always release the lease, even if upstream close fails or times out.
+        try:
+            await self._stream.close()
+        finally:
+            await self._capacity.__aexit__(None, None, None)
 
 
 class VolcengineSseStream:
@@ -206,10 +287,7 @@ class VolcengineSseStream:
         if self._closed:
             return
         self._closed = True
-        try:
-            await self.response.aclose()
-        finally:
-            _slots.release()
+        await complete_cleanup(self.response.aclose())
 
 
 async def _client_for(settings: Settings) -> httpx.AsyncClient:
@@ -239,8 +317,6 @@ async def close_synthesis_clients() -> None:
 
 
 def voice_options(settings: Settings) -> list[dict[str, str]]:
-    if settings.tts_protocol == "local-sherpa":
-        return [{"label": "中文本地音色 · Huayan", "value": "huayan:0"}]
     if settings.tts_protocol == "azure-speech":
         return [
             {"label": "晓晓 · 女声 · 温和自然", "value": "zh-CN-XiaoxiaoNeural"},
@@ -261,8 +337,6 @@ def voice_options(settings: Settings) -> list[dict[str, str]]:
 
 
 def effective_model(settings: Settings) -> str:
-    if settings.tts_protocol == "local-sherpa":
-        return "Huayan Chinese (CPU)"
     if settings.tts_protocol == "azure-speech":
         return "Azure Neural TTS"
     if settings.tts_protocol == "volcengine":
@@ -271,8 +345,6 @@ def effective_model(settings: Settings) -> str:
 
 
 def effective_voice(preferences: SpeechSettings, settings: Settings) -> str:
-    if settings.tts_protocol == "local-sherpa":
-        return f"huayan:{settings.tts_local_speaker_id}"
     voice = (preferences.cloud_voice or settings.tts_voice).strip()
     for option in voice_options(settings):
         if voice == option["label"]:
@@ -281,8 +353,6 @@ def effective_voice(preferences: SpeechSettings, settings: Settings) -> str:
 
 
 def is_configured(settings: Settings) -> bool:
-    if settings.tts_protocol == "local-sherpa":
-        return is_local_configured(settings)
     common = bool(settings.tts_base_url.strip() and settings.tts_api_key.strip())
     if settings.tts_protocol in {"azure-speech", "custom"}:
         return common
@@ -346,14 +416,10 @@ async def _open_volcengine_stream(
 ) -> VolcengineSseStream:
     request = _volcengine_request(text, preferences, settings, streaming=streaming)
     client = await _client_for(settings)
-    queued_at = time.monotonic()
-    acquired = False
     response: httpx.Response | None = None
     succeeded = False
     try:
-        await asyncio.wait_for(_slots.acquire(), timeout=settings.tts_timeout_seconds)
-        acquired = True
-        queue_ms = round((time.monotonic() - queued_at) * 1000, 2)
+        queue_ms = 0.0
         upstream_at = time.monotonic()
         response = await client.send(
             client.build_request(
@@ -385,11 +451,8 @@ async def _open_volcengine_stream(
     except httpx.HTTPError as exc:
         raise HTTPException(502, "tts_request_failed") from exc
     finally:
-        if not succeeded:
-            if response is not None:
-                await response.aclose()
-            if acquired:
-                _slots.release()
+        if not succeeded and response is not None:
+            await complete_cleanup(response.aclose())
 
 
 def _upstream_request(
@@ -520,22 +583,60 @@ def _valid_content_type(
     return content_type in allowed
 
 
+def _tts_cache_key(
+    text: str,
+    preferences: SpeechSettings,
+    settings: Settings,
+    *,
+    streaming: bool,
+) -> str | None:
+    if not settings.redis_enabled or settings.tts_cache_ttl_seconds <= 0:
+        return None
+    configuration = stable_hash(
+        settings.tts_protocol,
+        settings.tts_base_url.rstrip("/"),
+        effective_model(settings),
+        effective_voice(preferences, settings),
+        preferences.rate,
+        preferences.pitch,
+        preferences.volume,
+        streaming,
+        settings.tts_stream_response_format,
+        settings.tts_stream_sample_rate,
+        settings.tts_stream_channels,
+    )
+    return store.key("tts", configuration, stable_hash(text))
+
+
 async def synthesize(text: str, preferences: SpeechSettings, settings: Settings) -> bytes:
-    if settings.tts_protocol == "local-sherpa":
-        return await local_wav(text, preferences, settings)
+    cache_key = _tts_cache_key(text, preferences, settings, streaming=False)
+    if cache_key is not None:
+        cached = await store.get_bytes(cache_key)
+        if cached:
+            return cached
     if not is_configured(settings):
         raise HTTPException(503, "tts_not_configured")
-    if settings.tts_protocol == "volcengine":
-        stream = await _open_volcengine_stream(
-            text, preferences, settings, streaming=False,
-        )
-        return b"".join([block async for block in stream.iter_bytes()])
-    request = _upstream_request(text, preferences, settings, streaming=False)
-    client = await _client_for(settings)
     queued_at = time.monotonic()
     try:
-        async with asyncio.timeout(settings.tts_timeout_seconds):
-            async with _slots:
+        async with capacity_slot(
+            settings,
+            scope="tts-model",
+            limit=settings.tts_concurrency_limit,
+            wait_seconds=settings.tts_concurrency_wait_seconds,
+        ):
+            if settings.tts_protocol == "volcengine":
+                stream = await _open_volcengine_stream(
+                    text, preferences, settings, streaming=False,
+                )
+                audio = b"".join([block async for block in stream.iter_bytes()])
+                if cache_key is not None:
+                    await store.set_bytes(
+                        cache_key, audio, ttl_seconds=settings.tts_cache_ttl_seconds,
+                    )
+                return audio
+            request = _upstream_request(text, preferences, settings, streaming=False)
+            client = await _client_for(settings)
+            async with asyncio.timeout(settings.tts_timeout_seconds):
                 queue_ms = round((time.monotonic() - queued_at) * 1000, 2)
                 upstream_at = time.monotonic()
                 async with client.stream(
@@ -566,7 +667,14 @@ async def synthesize(text: str, preferences: SpeechSettings, settings: Settings)
                         queue_ms=queue_ms,
                         upstream_ms=round((time.monotonic() - upstream_at) * 1000, 2),
                     )
-                    return bytes(audio)
+                    result = bytes(audio)
+                    if cache_key is not None:
+                        await store.set_bytes(
+                            cache_key,
+                            result,
+                            ttl_seconds=settings.tts_cache_ttl_seconds,
+                        )
+                    return result
     except httpx.HTTPStatusError as exc:
         logger.warning("speech_synthesis_failed", upstream_status=exc.response.status_code)
         raise HTTPException(502, "tts_request_failed") from exc
@@ -587,49 +695,78 @@ async def open_synthesis_stream(
     text: str,
     preferences: SpeechSettings,
     settings: Settings,
-) -> SynthesisStream | LocalSynthesisStream | VolcengineSseStream:
+) -> (
+    SynthesisStream
+    | VolcengineSseStream
+    | MemorySynthesisStream
+    | CachingSynthesisStream
+    | CapacityManagedSynthesisStream
+):
     if not settings.tts_streaming_enabled:
         raise HTTPException(404, "tts_streaming_disabled")
     if not is_configured(settings):
         raise HTTPException(503, "tts_not_configured")
-    if settings.tts_protocol == "local-sherpa":
-        iterator = local_pcm(text, preferences, settings)
-        first = await anext(iterator)
-        return LocalSynthesisStream(first, iterator)
-    if settings.tts_protocol == "volcengine":
-        return await _open_volcengine_stream(text, preferences, settings, streaming=True)
-    request = _upstream_request(text, preferences, settings, streaming=True)
-    client = await _client_for(settings)
+    cache_key = _tts_cache_key(text, preferences, settings, streaming=True)
+    if cache_key is not None:
+        cached = await store.get_bytes(cache_key)
+        if cached:
+            return MemorySynthesisStream(cached)
+    capacity = capacity_slot(
+        settings,
+        scope="tts-model",
+        limit=settings.tts_concurrency_limit,
+        wait_seconds=settings.tts_concurrency_wait_seconds,
+    )
     queued_at = time.monotonic()
     acquired = False
     response: httpx.Response | None = None
     succeeded = False
     try:
-        await asyncio.wait_for(_slots.acquire(), timeout=settings.tts_timeout_seconds)
+        await capacity.__aenter__()
         acquired = True
+        if settings.tts_protocol == "volcengine":
+            base_stream = await _open_volcengine_stream(
+                text, preferences, settings, streaming=True,
+            )
+        else:
+            request = _upstream_request(text, preferences, settings, streaming=True)
+            client = await _client_for(settings)
+            upstream_request = client.build_request(
+                "POST",
+                request.url,
+                headers=request.headers,
+                params=request.params,
+                json=request.json,
+                content=request.content,
+            )
+            upstream_at = time.monotonic()
+            response = await client.send(upstream_request, stream=True)
+            if response.is_error:
+                (await _bounded_error(response)).raise_for_status()
+            if not _valid_content_type(
+                response, streaming=True, protocol=settings.tts_protocol,
+            ):
+                raise HTTPException(502, "tts_stream_response_invalid")
+            base_stream = SynthesisStream(
+                response,
+                characters=len(text),
+                queue_ms=round((time.monotonic() - queued_at) * 1000, 2),
+                upstream_at=upstream_at,
+            )
+            response = None
+        stream = CapacityManagedSynthesisStream(base_stream, capacity)
         queue_ms = round((time.monotonic() - queued_at) * 1000, 2)
-        upstream_at = time.monotonic()
-        upstream_request = client.build_request(
-            "POST",
-            request.url,
-            headers=request.headers,
-            params=request.params,
-            json=request.json,
-            content=request.content,
-        )
-        response = await client.send(upstream_request, stream=True)
-        if response.is_error:
-            (await _bounded_error(response)).raise_for_status()
-        if not _valid_content_type(
-            response, streaming=True, protocol=settings.tts_protocol,
-        ):
-            raise HTTPException(502, "tts_stream_response_invalid")
+        if queue_ms >= 100:
+            logger.info("speech_stream_capacity_acquired", queue_ms=queue_ms)
         succeeded = True
-        return SynthesisStream(
-            response,
-            characters=len(text),
-            queue_ms=queue_ms,
-            upstream_at=upstream_at,
+        return (
+            CachingSynthesisStream(
+                stream,
+                cache_key=cache_key,
+                ttl_seconds=settings.tts_cache_ttl_seconds,
+            )
+            if cache_key is not None
+            else stream
         )
     except httpx.HTTPStatusError as exc:
         logger.warning("speech_stream_open_failed", upstream_status=exc.response.status_code)
@@ -643,7 +780,9 @@ async def open_synthesis_stream(
     finally:
         # A successful stream owns both resources until its iterator finishes.
         if not succeeded:
-            if response is not None:
-                await response.aclose()
-            if acquired:
-                _slots.release()
+            try:
+                if response is not None:
+                    await complete_cleanup(response.aclose())
+            finally:
+                if acquired:
+                    await complete_cleanup(capacity.__aexit__(None, None, None))

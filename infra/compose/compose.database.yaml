@@ -4,6 +4,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
+    command: ["postgres", "-c", "max_connections=${POSTGRES_MAX_CONNECTIONS:-100}"]
     environment:
       POSTGRES_DB: medical_agent
       POSTGRES_USER: medical_agent
@@ -18,6 +19,32 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    stop_grace_period: 30s
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${MEDICAL_REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - volatile-lru
+    ports:
+      - "127.0.0.1:${MEDICAL_REDIS_PORT:-56379}:6379"
+    volumes:
+      - medical_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 15s
 
 volumes:
   medical_postgres:
+  medical_redis:

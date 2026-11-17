@@ -22,7 +22,7 @@ const probeErrors: Record<string, string> = {
   probe_failed: "探活失败",
 };
 
-export function ModelsPanel({ token }: { token: string }) {
+export function ModelsPanel({ token, embedded = false, canManage }: { token: string; embedded?: boolean; canManage: boolean }) {
   const screens = Grid.useBreakpoint();
   const compact = !screens.sm;
   const [inventory, setInventory] = useState<ModelInventory | null>(null);
@@ -69,6 +69,8 @@ export function ModelsPanel({ token }: { token: string }) {
   }
 
   useEffect(() => () => window.speechSynthesis?.cancel(), []);
+
+  useEffect(() => { if (!canManage) setSelected(null); }, [canManage]);
 
   useEffect(() => {
     let active = true;
@@ -175,10 +177,10 @@ export function ModelsPanel({ token }: { token: string }) {
   return <>
     <ErrorNotice error={error} />
     {inventory && <>
-      <section className="knowledge-section">
+      <section className={embedded ? "overview-tab-panel" : "knowledge-section"}>
         <div className="section-heading">
-          <div><h2>模型服务</h2><span>当前配置与最近探活状态</span></div>
-          <Tooltip title="测试请求可能产生少量模型调用费用"><Button icon={<Activity size={16} />} loading={busy === "all"} disabled={busy !== null && busy !== "all"} onClick={() => void probeAll()}>全部探活</Button></Tooltip>
+          <div><h2>{embedded ? "服务配置" : "模型服务"}</h2><span>当前配置与最近探活状态</span></div>
+          <Tooltip title={canManage ? "测试请求可能产生少量模型调用费用" : "完成二次验证后可执行探活"}><Button icon={<Activity size={16} />} loading={busy === "all"} disabled={!canManage || (busy !== null && busy !== "all")} onClick={() => void probeAll()}>全部探活</Button></Tooltip>
         </div>
         {configurationError && <Alert className="model-configuration-notice" type="warning" showIcon message="模型配置暂不可用" description={configurationError} />}
         <Table<ModelConfig> rowKey="kind" size="small" pagination={false} tableLayout="fixed" dataSource={inventory.items} columns={[
@@ -187,7 +189,7 @@ export function ModelsPanel({ token }: { token: string }) {
           { title: "服务地址", dataIndex: "endpoint_host", responsive: ["lg"], render: (value: string) => value || "—" },
           { title: "配置", width: 110, responsive: ["md"], render: (_, row) => <Tag color={row.client_only ? "default" : row.configured ? "green" : "default"}>{row.client_only ? "需本机验证" : row.configured ? "已配置" : "不完整"}</Tag> },
           { title: "最近探活", width: 190, responsive: ["sm"], render: (_, row) => row.last_probe ? <div className="probe-result"><Tag color={statusColor[row.last_probe.status]}>{statusText[row.last_probe.status] ?? row.last_probe.status}</Tag><span>{row.last_probe.latency_ms?.toFixed(0) ?? "—"} ms · {new Date(row.last_probe.created_at).toLocaleString("zh-CN", { hour12: false })}</span>{row.last_probe.error && <Tooltip title={probeErrors[row.last_probe.error] ?? row.last_probe.error}><code>{probeErrors[row.last_probe.error] ?? row.last_probe.error}</code></Tooltip>}</div> : "尚未探活" },
-          { title: "操作", width: compact ? 112 : 150, render: (_, row) => <Space size={6}><Button size="small" title={row.client_only ? "测试当前管理员设备播报，不代表患者设备" : "发送测试请求，可能产生调用费用"} disabled={busy !== null && busy !== row.kind} loading={busy === row.kind} onClick={() => void probe(row.kind)}>探活</Button>{!row.client_only && <Tooltip title={!configuration ? "重启后端后可配置" : "修改模型配置"}><span><Button size="small" icon={<Settings2 size={14} />} disabled={!configuration} onClick={() => edit(row)} aria-label={`配置${row.label}`}>{compact ? null : "配置"}</Button></span></Tooltip>}</Space> },
+          { title: "操作", width: compact ? 112 : 150, render: (_, row) => <Space size={6}><Button size="small" title={row.client_only ? "测试当前管理员设备播报，不代表患者设备" : "发送测试请求，可能产生调用费用"} disabled={!canManage || (busy !== null && busy !== row.kind)} loading={busy === row.kind} onClick={() => void probe(row.kind)}>探活</Button>{!row.client_only && <Tooltip title={!canManage ? "完成二次验证后可修改" : !configuration ? "重启后端后可配置" : "修改模型配置"}><span><Button size="small" icon={<Settings2 size={14} />} disabled={!canManage || !configuration} onClick={() => edit(row)} aria-label={`配置${row.label}`}>{compact ? null : "配置"}</Button></span></Tooltip>}</Space> },
         ]} expandable={{ expandedRowKeys: expanded, onExpandedRowsChange: keys => setExpanded([...keys]), expandedRowRender: row => <div className="model-expanded">
           {diagnostics(row)}
           {row.kind === "tts" && row.last_probe && <p className="muted">上次探活使用：{String(row.last_probe.detail.model ?? "未知模型")} · {String(row.last_probe.detail.voice ?? "未知音色")} · {String(row.last_probe.detail.configuration ?? "已保存设置")}{row.last_probe.detail.first_audio_ms != null ? ` · 首包 ${Number(row.last_probe.detail.first_audio_ms).toFixed(0)} ms` : ""}</p>}
@@ -196,7 +198,7 @@ export function ModelsPanel({ token }: { token: string }) {
     </>}
     <Drawer title={selected ? `配置${selected.label}` : "模型配置"} open={!!selected} onClose={() => setSelected(null)} width={selected?.kind === "tts" ? 640 : 520} destroyOnClose={false} extra={configTab === "model" && <Space><Popconfirm title="恢复 .env 配置？" description="将删除该能力在管理端保存的覆盖值。" okText="恢复" cancelText="取消" onConfirm={() => void resetConfiguration()}><Button danger type="text" icon={<RotateCcw size={15} />} disabled={!selected || !configuration?.overridden_kinds.includes(selected.kind)}>恢复默认</Button></Popconfirm><Button type="primary" loading={busy === `save:${selected?.kind}`} onClick={() => void saveConfiguration()}>保存并生效</Button></Space>}>
       {selected?.kind === "tts" && <Tabs activeKey={configTab} onChange={setConfigTab} items={[{ key: "model", label: "模型连接" }, { key: "speech", label: "音色与播报" }]} />}
-      {selected?.kind === "tts" && configTab === "speech" && <Suspense fallback={<Spin />}><SpeechPanel token={token} onSaved={() => setRevision(value => value + 1)} /></Suspense>}
+      {selected?.kind === "tts" && configTab === "speech" && <Suspense fallback={<Spin />}><SpeechPanel token={token} canManage={canManage} onSaved={() => setRevision(value => value + 1)} /></Suspense>}
       {selected && <Form hidden={configTab !== "model"} form={form} layout="vertical" className="model-config-form" requiredMark={false}>
         <Alert type="info" showIcon message="保存后当前后端进程立即生效" description="API Key 仅写入，不会在页面或接口中返回；留空会保留当前密钥。" />
         {(selected.kind === "chat" || selected.kind === "asr") && <Form.Item name="provider" label="服务类型"><Select options={(selected.kind === "chat" ? ["openai-compatible", "demo"] : ["openai-compatible", "disabled"]).map(value => ({ value, label: value }))} /></Form.Item>}
@@ -208,7 +210,6 @@ export function ModelsPanel({ token }: { token: string }) {
           { value: "elevenlabs", label: "ElevenLabs" },
           { value: "volcengine", label: "火山引擎豆包语音" },
           { value: "custom", label: "自定义 JSON 接口" },
-          { value: "local-sherpa", label: "本地中文语音（CPU，无需 API Key）" },
         ]} /></Form.Item>}
         {selected.kind === "tts" && selectedProtocol === "azure-speech" && <Alert type="info" showIcon message="Azure 低延迟中文语音" description="服务地址填写资源所在区域，例如 https://eastasia.tts.speech.microsoft.com；API Key 填写该 Speech 资源的 Key。保存后到“音色与播报”选择晓晓等中文音色。" />}
         {selected.kind === "tts" && selectedProtocol === "elevenlabs" && <Alert type="info" showIcon message="ElevenLabs Flash" description="已自动选择 eleven_flash_v2_5 和流式音频；API Key 与音色 ID 需要从 ElevenLabs 控制台获取。" />}
@@ -221,7 +222,11 @@ export function ModelsPanel({ token }: { token: string }) {
         <Form.Item name="timeout_seconds" label="超时时间（秒）"><InputNumber min={1} max={300} precision={0} style={{ width: "100%" }} /></Form.Item>
         {["chat", "chat_fallback", "vision"].includes(selected.kind) && <><Form.Item name="max_tokens" label="最大输出 Token"><InputNumber min={1} max={100000} precision={0} style={{ width: "100%" }} /></Form.Item><Form.Item name="enable_thinking" label="思考模式" valuePropName="checked"><Switch checkedChildren="开启" unCheckedChildren="关闭" /></Form.Item></>}
         {selected.kind === "chat" && <Form.Item name="retry_count" label="首包前重试次数" extra="推荐 1 次；仍失败后自动请求备用对话模型"><InputNumber min={0} max={3} precision={0} style={{ width: "100%" }} /></Form.Item>}
-        {selected.kind === "embedding" && <Form.Item name="batch_size" label="向量批大小"><InputNumber min={1} max={256} precision={0} style={{ width: "100%" }} /></Form.Item>}
+        {["chat", "vision", "asr", "reranker", "tts"].includes(selected.kind) && <><Form.Item name="concurrency_limit" label="该能力并发上限" extra="按能力独立保护上游服务；设为 0 表示关闭容量控制。"><InputNumber min={0} max={1000} precision={0} style={{ width: "100%" }} /></Form.Item><Form.Item name="concurrency_wait_seconds" label="排队上限（秒）" extra="超过时间仍没有空位时返回服务繁忙，避免慢请求拖垮其他功能。"><InputNumber min={0.1} max={300} style={{ width: "100%" }} /></Form.Item></>}
+        {selected.kind === "embedding" && <>
+          <Form.Item name="batch_size" label="向量批大小"><InputNumber min={1} max={256} precision={0} style={{ width: "100%" }} /></Form.Item>
+          <Form.Item name="dimensions" label="向量维度" extra="留空使用模型默认维度；更改后必须全量重建知识库向量。"><InputNumber min={1} max={65536} precision={0} style={{ width: "100%" }} /></Form.Item>
+        </>}
         {selected.kind === "reranker" && <Form.Item name="candidate_k" label="候选条数" extra="先由混合检索召回，再从这些候选中精排 Top K"><InputNumber min={1} max={100} precision={0} style={{ width: "100%" }} /></Form.Item>}
       </Form>}
     </Drawer>

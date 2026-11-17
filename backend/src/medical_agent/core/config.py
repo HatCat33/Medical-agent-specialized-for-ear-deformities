@@ -1,13 +1,22 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+BACKEND_DIR = Path(__file__).resolve().parents[3]
+
+
+def backend_path(value: str) -> Path:
+    """Resolve relative runtime paths from backend, independent of the launch directory."""
+    path = Path(value).expanduser()
+    return path.resolve() if path.is_absolute() else (BACKEND_DIR / path).resolve()
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=BACKEND_DIR / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -18,18 +27,65 @@ class Settings(BaseSettings):
     log_json: bool = False
     log_file_path: str = "./logs/medical-agent.jsonl"
     log_max_bytes: int = 10 * 1024 * 1024
-    log_backup_count: int = 10
+    log_timezone: str = "Asia/Shanghai"
+    log_retention_days: int = Field(default=15, ge=0, le=3650)
     interaction_log_enabled: bool = True
     interaction_log_file_path: str = "./logs/interactions.jsonl"
     interaction_log_include_content: bool = False
     interaction_log_max_content_chars: int = Field(default=20_000, ge=0, le=200_000)
     interaction_log_max_bytes: int = 20 * 1024 * 1024
-    interaction_log_backup_count: int = 30
+    interaction_log_timezone: str = "Asia/Shanghai"
+    interaction_log_retention_days: int = Field(default=0, ge=0, le=3650)
+
+    @property
+    def resolved_log_file_path(self) -> str:
+        return str(backend_path(self.log_file_path)) if self.log_file_path else ""
+
+    @property
+    def resolved_interaction_log_file_path(self) -> str:
+        return (
+            str(backend_path(self.interaction_log_file_path))
+            if self.interaction_log_file_path
+            else ""
+        )
+
     database_url: str = "sqlite+aiosqlite:///./medical_agent.db"
+    # Pool limits are per API process. Keep deployment worker count in the
+    # Keep the per-process pool within the PostgreSQL connection budget.
+    database_pool_size: int = Field(default=20, ge=1, le=100)
+    database_max_overflow: int = Field(default=30, ge=0, le=100)
+    database_pool_timeout_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
+    database_pool_recycle_seconds: int = Field(default=1800, ge=0, le=86_400)
+    database_pool_pre_ping: bool = True
+    redis_enabled: bool = False
     redis_url: str = "redis://localhost:6379/0"
+    redis_key_prefix: str = Field(default="medical-agent", min_length=1, max_length=80)
+    redis_connect_timeout_seconds: float = Field(default=1.5, gt=0.0, le=30.0)
+    redis_operation_timeout_seconds: float = Field(default=3.0, gt=0.0, le=30.0)
+    embedding_cache_ttl_seconds: int = Field(default=2_592_000, ge=0, le=31_536_000)
+    retrieval_cache_ttl_seconds: int = Field(default=600, ge=0, le=86_400)
+    # Audio can contain sensitive medical content. Keep disabled unless the
+    # deployment has an access-controlled Redis and an approved retention period.
+    tts_cache_ttl_seconds: int = Field(default=0, ge=0, le=604_800)
+    chat_rate_limit_requests: int = Field(default=30, ge=0, le=10_000)
+    chat_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
+    chat_idempotency_ttl_seconds: int = Field(default=600, ge=0, le=86_400)
+    model_concurrency_limit: int = Field(default=20, ge=0, le=1000)
+    model_concurrency_wait_seconds: float = Field(default=15.0, ge=0.1, le=300.0)
+    model_concurrency_lease_seconds: int = Field(default=300, ge=30, le=3600)
+    vision_concurrency_limit: int = Field(default=8, ge=0, le=1000)
+    vision_concurrency_wait_seconds: float = Field(default=60.0, ge=0.1, le=300.0)
+    asr_concurrency_limit: int = Field(default=8, ge=0, le=1000)
+    asr_concurrency_wait_seconds: float = Field(default=60.0, ge=0.1, le=300.0)
+    tts_concurrency_limit: int = Field(default=8, ge=0, le=1000)
+    tts_concurrency_wait_seconds: float = Field(default=60.0, ge=0.1, le=300.0)
+    reranker_concurrency_limit: int = Field(default=12, ge=0, le=1000)
+    reranker_concurrency_wait_seconds: float = Field(default=30.0, ge=0.1, le=300.0)
     cors_origins: str = "http://localhost:5173"
     cors_origin_regex: str = ""
     admin_api_token: str = ""
+    admin_secondary_token: str = ""
+    admin_secondary_authorization_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
 
     llm_provider: str = "demo"
     llm_base_url: str = ""
@@ -75,16 +131,12 @@ class Settings(BaseSettings):
     tts_voice: str = ""
     tts_timeout_seconds: float = Field(default=30, gt=0, le=120)
     tts_protocol: Literal[
-        "openai-compatible", "azure-speech", "elevenlabs", "volcengine", "custom",
-        "local-sherpa"
+        "openai-compatible", "azure-speech", "elevenlabs", "volcengine", "custom"
     ] = "openai-compatible"
     tts_streaming_enabled: bool = False
     tts_stream_response_format: str = Field(default="pcm", min_length=1, max_length=80)
     tts_stream_sample_rate: int = Field(default=24_000, ge=8_000, le=96_000)
     tts_stream_channels: int = Field(default=1, ge=1, le=2)
-    tts_local_model_dir: str = "./data/tts/huayan"
-    tts_local_threads: int = Field(default=2, ge=1, le=16)
-    tts_local_speaker_id: int = Field(default=0, ge=0)
     # Generic JSON adapter for a self-hosted service. The frontend still receives PCM s16le.
     tts_custom_path: str = "/audio/speech"
     tts_custom_auth_header: str = "Authorization"
@@ -108,16 +160,20 @@ class Settings(BaseSettings):
     embedding_base_url: str = ""
     embedding_api_key: str = ""
     embedding_model: str = ""
+    embedding_dimensions: int | None = Field(default=None, ge=1, le=65_536)
     embedding_timeout_seconds: float = Field(default=60.0, gt=0.0, le=300.0)
     embedding_batch_size: int = Field(default=32, ge=1, le=256)
+    embedding_query_batch_size: int = Field(default=25, ge=1, le=256)
+    embedding_query_batch_wait_ms: int = Field(default=20, ge=0, le=500)
     reranker_enabled: bool = False
     reranker_base_url: str = ""
     reranker_api_key: str = ""
     reranker_model: str = ""
     reranker_timeout_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
     reranker_candidate_k: int = Field(default=12, ge=1, le=100)
-    knowledge_draft_limit: int = Field(default=5, ge=1, le=50)
-    prompt_draft_limit: int = Field(default=5, ge=1, le=50)
+    knowledge_draft_limit: int = Field(default=3, ge=1, le=50)
+    prompt_draft_limit: int = Field(default=3, ge=1, le=50)
+    announcement_draft_limit: int = Field(default=3, ge=1, le=50)
 
     wecom_bot_enabled: bool = False
     wecom_bot_id: str = ""

@@ -1,4 +1,9 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+
 import {
+  Bell,
+  Check,
+  Copy,
   MessageSquareText,
   PanelLeftClose,
   PanelLeftOpen,
@@ -15,11 +20,14 @@ interface HistorySidebarProps {
   open: boolean;
   collapsed: boolean;
   busy: boolean;
+  userReference: string;
+  unreadAnnouncements: number;
   onClose: () => void;
   onToggleCollapsed: () => void;
   onCreate: () => void;
   onSelect: (conversationId: string) => void;
   onDelete: (conversationId: string) => void;
+  onOpenAnnouncements: () => void;
 }
 
 function displayTime(value: string | null): string {
@@ -38,12 +46,53 @@ export function HistorySidebar({
   open,
   collapsed,
   busy,
+  userReference,
+  unreadAnnouncements,
   onClose,
   onToggleCollapsed,
   onCreate,
   onSelect,
   onDelete,
+  onOpenAnnouncements,
 }: HistorySidebarProps) {
+  const historyListRef = useRef<HTMLDivElement>(null);
+  const [scrollIndicator, setScrollIndicator] = useState({ visible: false, height: 0, top: 0 });
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<number | null>(null);
+
+  const updateScrollIndicator = useCallback(() => {
+    const list = historyListRef.current;
+    if (!list || list.scrollHeight <= list.clientHeight) {
+      setScrollIndicator({ visible: false, height: 0, top: 0 });
+      return;
+    }
+    const height = Math.max(56, (list.clientHeight / list.scrollHeight) * list.clientHeight);
+    const top = (list.scrollTop / (list.scrollHeight - list.clientHeight)) * (list.clientHeight - height);
+    setScrollIndicator({ visible: true, height, top });
+  }, []);
+
+  useEffect(() => {
+    const list = historyListRef.current;
+    if (!list) return;
+    updateScrollIndicator();
+    const observer = new ResizeObserver(updateScrollIndicator);
+    observer.observe(list);
+    for (const child of list.children) observer.observe(child);
+    return () => observer.disconnect();
+  }, [conversations, updateScrollIndicator]);
+
+  async function copyUserReference() {
+    if (!userReference || userReference === "暂不可用") return;
+    await navigator.clipboard.writeText(userReference);
+    setCopied(true);
+    if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+    copiedTimer.current = window.setTimeout(() => setCopied(false), 1600);
+  }
+
+  useEffect(() => () => {
+    if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+  }, []);
+
   const orderedConversations = [...conversations].sort((left, right) => {
     const leftTime = new Date(left.last_message_at ?? left.created_at).getTime();
     const rightTime = new Date(right.last_message_at ?? right.created_at).getTime();
@@ -85,7 +134,7 @@ export function HistorySidebar({
       </button>
 
       <div className="history-body">
-        <div className="history-list">
+        <div className="history-list" ref={historyListRef} onScroll={updateScrollIndicator}>
           {conversations.length === 0 ? (
             <div className="history-empty"><MessageSquareText size={21} /><p>还没有历史会话</p><span>发出第一条问题后会保存在这里</span></div>
           ) : (
@@ -120,6 +169,42 @@ export function HistorySidebar({
             ))
           )}
         </div>
+        {scrollIndicator.visible ? (
+          <span
+            className="history-scroll-indicator"
+            aria-hidden="true"
+            style={{ height: scrollIndicator.height, transform: `translateY(${scrollIndicator.top}px)` }}
+          />
+        ) : null}
+      </div>
+
+      <div className="history-user-reference" title="如需协助定位记录，请提供此用户 ID">
+        <div className="history-user-reference-main">
+          <div className="history-user-reference-label">
+            <span>用户 ID</span>
+            <button
+              className={copied ? "is-copied" : ""}
+              type="button"
+              onClick={() => void copyUserReference()}
+              disabled={!userReference || userReference === "暂不可用"}
+              title={copied ? "已复制" : "复制用户 ID"}
+              aria-label={copied ? "用户 ID 已复制" : "复制用户 ID"}
+            >
+              {copied ? <Check size={14} /> : <Copy size={14} />}
+            </button>
+          </div>
+          <code>{userReference || "正在生成…"}</code>
+        </div>
+        <button
+          className="history-announcement-button"
+          type="button"
+          onClick={onOpenAnnouncements}
+          title="查看公告"
+          aria-label={unreadAnnouncements ? `查看公告，${unreadAnnouncements} 条未读` : "查看公告"}
+        >
+          <Bell size={18} />
+          {unreadAnnouncements > 0 ? <span className="announcement-unread-dot" /> : null}
+        </button>
       </div>
     </aside>
   );

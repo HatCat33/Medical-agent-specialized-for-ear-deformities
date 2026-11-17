@@ -11,7 +11,10 @@ from urllib.parse import urlparse
 
 import httpx
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from websockets.asyncio.client import ClientConnection, connect
+from websockets.asyncio.client import (  # pyright: ignore[reportMissingTypeStubs]
+    ClientConnection,
+    connect,
+)
 from websockets.exceptions import ConnectionClosed
 
 from medical_agent.core.logging import get_logger

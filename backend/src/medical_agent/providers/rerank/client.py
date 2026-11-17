@@ -1,14 +1,42 @@
 """Cohere/Jina-compatible reranking client."""
 
+import asyncio
 from dataclasses import dataclass
+from typing import cast
 
 import httpx
 
 from medical_agent.core.config import Settings
+from medical_agent.core.redis import capacity_slot
+
+_clients: dict[tuple[str, float, int], httpx.AsyncClient] = {}
+_client_lock = asyncio.Lock()
 
 
 class RerankerProviderError(RuntimeError):
     pass
+
+
+async def _client_for(base_url: str, timeout: float) -> httpx.AsyncClient:
+    key = (base_url.rstrip("/"), timeout, id(httpx.AsyncClient))
+    existing = _clients.get(key)
+    if existing is not None:
+        return existing
+    async with _client_lock:
+        existing = _clients.get(key)
+        if existing is None:
+            existing = httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            )
+            _clients[key] = existing
+        return existing
+
+
+async def close_reranker_clients() -> None:
+    clients = list(_clients.values())
+    _clients.clear()
+    await asyncio.gather(*(client.aclose() for client in clients), return_exceptions=True)
 
 
 @dataclass(frozen=True)
@@ -23,6 +51,7 @@ class CompatibleRerankerProvider:
         self.api_key = settings.reranker_api_key
         self.model = settings.reranker_model
         self.timeout = settings.reranker_timeout_seconds
+        self.settings = settings
 
     async def rerank(
         self,
@@ -35,7 +64,14 @@ class CompatibleRerankerProvider:
             raise RerankerProviderError("reranker_not_configured")
         endpoint = self.base_url if self.base_url.endswith("/rerank") else f"{self.base_url}/rerank"
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            client = await _client_for(self.base_url, self.timeout)
+            async with capacity_slot(
+                self.settings,
+                scope="reranker-model",
+                limit=self.settings.reranker_concurrency_limit,
+                wait_seconds=self.settings.reranker_concurrency_wait_seconds,
+                lease_seconds=max(30, int(self.timeout) + 30),
+            ):
                 response = await client.post(
                     endpoint,
                     headers={"Authorization": f"Bearer {self.api_key}"},
@@ -48,18 +84,32 @@ class CompatibleRerankerProvider:
                     },
                 )
                 response.raise_for_status()
-                payload = response.json()
+                payload: object = response.json()
+        except TimeoutError as exc:
+            raise RerankerProviderError("reranker_capacity_exhausted") from exc
         except (httpx.HTTPError, ValueError) as exc:
             raise RerankerProviderError("reranker_request_failed") from exc
 
-        rows = payload.get("results", payload.get("data")) if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            raise RerankerProviderError("reranker_response_invalid")
+        payload_fields = cast(dict[str, object], payload)
+        rows = payload_fields.get("results", payload_fields.get("data"))
         if not isinstance(rows, list):
             raise RerankerProviderError("reranker_response_invalid")
         results: list[RerankResult] = []
         try:
-            for row in rows:
-                index = int(row["index"])
-                score = float(row.get("relevance_score", row.get("score")))
+            for item in cast(list[object], rows):
+                if not isinstance(item, dict):
+                    raise TypeError("result_not_an_object")
+                row = cast(dict[str, object], item)
+                index_value = row["index"]
+                score_value = row.get("relevance_score", row.get("score"))
+                if not isinstance(index_value, (int, str)) or not isinstance(
+                    score_value, (int, float, str)
+                ):
+                    raise TypeError("result_value_invalid")
+                index = int(index_value)
+                score = float(score_value)
                 if not 0 <= index < len(documents):
                     raise ValueError("index_out_of_range")
                 results.append(RerankResult(index=index, score=score))

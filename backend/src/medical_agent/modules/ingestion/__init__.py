@@ -1,2 +1,1 @@
-"""Hospital asset upload, parsing, redaction, review, and indexing pipelines."""
-
+"""Hospital FAQ workbook parsing used by knowledge management."""

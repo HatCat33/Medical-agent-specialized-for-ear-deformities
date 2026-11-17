@@ -1,5 +1,5 @@
-export type AdminSection = "overview" | "versions" | "chunks" | "tests" | "prompts" | "operations";
+export type AdminSection = "overview" | "knowledge" | "tests" | "prompts" | "announcements";
 export const sectionNames: Record<AdminSection, string> = {
-  overview: "运行总览", versions: "知识版本", chunks: "分块管理", tests: "检索与评测",
-  prompts: "提示词管理", operations: "任务与记录",
+  overview: "运行总览", knowledge: "知识库管理", tests: "检索与评测",
+  prompts: "提示词管理", announcements: "公告管理",
 };

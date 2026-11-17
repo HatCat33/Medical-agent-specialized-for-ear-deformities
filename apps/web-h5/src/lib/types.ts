@@ -57,3 +57,13 @@ export interface TranscriptionResult {
 }
 
 export type InputMode = "text" | "voice" | "multimodal";
+
+export interface Announcement {
+  id: string;
+  title: string;
+  content: string;
+  status: "published";
+  created_at: string;
+  updated_at: string;
+  published_at: string;
+}

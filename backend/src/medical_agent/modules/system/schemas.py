@@ -61,12 +61,22 @@ class ModelConfigurationUpdate(BaseModel):
     enable_thinking: bool | None = None
     language: str | None = Field(default=None, min_length=2, max_length=35)
     batch_size: int | None = Field(default=None, ge=1, le=256)
+    dimensions: int | None = Field(default=None, ge=1, le=65_536)
     voice: str | None = Field(default=None, max_length=500)
     protocol: Literal[
         "openai-compatible", "azure-speech", "elevenlabs", "volcengine", "custom",
-        "local-sherpa",
     ] | None = None
     streaming_enabled: bool | None = None
     retry_count: int | None = Field(default=None, ge=0, le=3)
+    concurrency_limit: int | None = Field(default=None, ge=0, le=1000)
+    concurrency_wait_seconds: float | None = Field(default=None, ge=0.1, le=300)
     enabled: bool | None = None
     candidate_k: int | None = Field(default=None, ge=1, le=100)
+
+
+class RetrievalConfigurationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    top_k: int = Field(ge=1, le=20)
+    min_score: float = Field(ge=0, le=1)
+    relative_score: float = Field(ge=0, le=1)

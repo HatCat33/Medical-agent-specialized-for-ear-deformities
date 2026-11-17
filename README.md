@@ -1,290 +1,118 @@
-# 耳畸形专科医疗科普问答智能体
+## 医院耳畸形专科Agent智能助手
 
-面向医院患者及家属的耳畸形健康科普问答系统。当前 `0.4.0` 为 **Demo 测试版**：在患者端多模态问答、历史会话和版本化 RAG 管理基础上，加入同会话滚动摘要、图片上下文、企业微信智能机器人 API 模式与微信客服回调渠道，用于经理演示和阶段验收。
+该项目为面向西安国际医疗中心（国内最大单体综合性医院）北院的整形医院对耳畸形儿童患者及家属的健康科普助手，依托医院的话术以及资料库，对其提供相关的一般知识、就诊准备以及术前术后的日常护理，不对病症进行诊断。
 
-> 本项目只提供健康科普信息，不能替代医生面诊、诊断或治疗建议。Demo 测试版仅用于受控演示和功能验证，不是可直接承载真实患者数据的生产系统。
+**患者端**：支持文本、图像、语音输入，流式回答并同步语音播报、历史会话管理等
 
-## 当前状态
+**管理端**：支持按时间、用户ID导出对应交互内容，以xlsx形式；知识库支持增量更新；检索与评测支持在线单条检索，批量评测，查看召回率等各种指标，同时也能够进行多轮对话测试；支持公告管理，迭代更新能向患者端推送公告通知；支持接入企业微信H5，智能bot以及微信客服渠道。
 
-已实现：
+> 目前这版上线为测试版，供医院医生使用、调试以及反馈。
 
-- React 移动端 H5，支持桌面与手机浏览器。
-- 单行输入区；手机统一使用系统图片选择器，桌面端额外支持摄像头弹窗拍照。
-- 桌面历史侧栏可收起并记忆状态；移动端支持按钮或从左侧区域右滑，以 Push 推开方式进入历史会话，支持跟手拖动、左滑/点击遮罩返回。
-- FastAPI 会话接口与 SQLite / Docker PostgreSQL 持久化。
-- 新建、查看、删除历史会话，以及匿名访客隔离。
-- OpenAI-compatible Chat Completions 模型接入。
-- 从模型到浏览器的 SSE 流式输出、停止生成、部分回答保存，以及首包前断线后的后台续答落库；前端按会话与回答任务隔离迟到回调和语音队列，后台同步不会串入当前会话。
-- Markdown 安全渲染，不执行模型返回的原始 HTML。
-- 单次最多四张 JPG、PNG、WebP、HEIC 或 HEIF 图片；手机系统统一提供拍照或相册来源，支持图片加文字的视觉问答。
-- 图片私有存储、访客归属校验、历史回看及随会话删除。
-- 按住录音、松开转写并自动发送；回答生成时按自然短句同步合成、预取和播报，支持设备音色或兼容接口的云端 TTS，并适配手机浏览器的音频播放限制。
-- 请求、媒体、会话和模型事件的结构化轮转日志。
-- 独立问答追踪日志，将输入、输出、模型、RAG 命中、耗时、状态及错误关联到同一次交互。
-- 医院 FAQ XLSX 只读校验、冲突检测、版本发布及关键词/可选向量混合检索。
-- 顶部导航管理端：运行总览与交互次数、知识版本、chunk 查看/编辑/删除、XLSX 增量合并、后台向量任务、发布回退与操作记录。
-- 管理端检索实验与批量标注评测：默认从标准问题按分类均衡生成，支持命中率、Recall@K、MRR、无结果准确率、报告保存和导出。
-- 版本化提示词管理：系统与业务提示词均支持草稿、发布和历史回退，患者问答实时采用当前发布版本；独立医疗风险规则仍由安全模块执行。
-- 主文本、备用文本、视觉、ASR、Embedding、Rerank 与 TTS 配置、运行时修改和显式手动探活；API Key 只允许写入，不返回管理端。
-- Docker PostgreSQL 部署、Alembic 结构迁移、SQLite 数据复制及逐表行数核对。
-- 检索上下文与生成模型解耦，后端保留知识来源关联供评测和排障，患者端不展示参考资料；低召回时可禁止通用模型补答。
-- 急症提示以及诊断、分型、处方和手术判定请求的基础边界控制。
-- 无模型配置时可运行的 `demo` 模式。
-- 当前会话超过原文窗口后自动滚动压缩，保留最近原文、历史摘要和最近图片；不建立跨会话长期记忆。
-- 企业微信智能机器人 API 模式，以及微信客服加密回调、增量拉取、消息去重和文本回复。
-
-尚未实现：
-
-- PDF、视频转写内容的解析、切分、审核和 RAG 检索。
-- 多级审核审批、独立管理员账户和角色权限。
-- 医院内网私有化 ASR、语音原文件历史和医生音色克隆播报。
-- 视频上传、转写和知识抽取。
-- 飞书事件回调，以及企业微信渠道的主动消息、卡片、视频和文件处理扩展。
-- 生产级身份认证、限流、审计、数据保留与监控告警。
-
-本次范围见 [Demo 测试版发布记录](docs/releases/2026-10-26-demo.md) 和 [Demo 演示检查清单](docs/operations/demo-checklist.md)；RAG 基线见 [第三版 RAG 范围](docs/product/v3-rag-scope.md) 与 [RAG 架构说明](docs/architecture/rag.md)。
-
-## 技术架构
-
-```text
-患者浏览器 / 内嵌 H5
-        |
-        v
-React + Vite  ----SSE---->  FastAPI API
-                              |-- safety 医疗边界
-                              |-- conversation 会话与历史
-                              |-- media 图片与授权读取
-                              |-- speech 语音转写
-                              |-- knowledge FAQ 发布与混合检索
-                              |-- providers 文本/视觉/ASR/Embedding 适配层
-                              `-- SQLite 或 Docker PostgreSQL + 私有媒体目录
-
-后续：pgvector 原生近邻索引 / Redis 多进程任务队列 / 对象存储
+## 1、项目结构
 ```
+apps/
+  web-h5/                 患者端
+  admin-web/              管理端
+backend/
+  src/medical_agent/      FastAPI 应用
+  migrations/             Alembic 数据库迁移
+  scripts/                数据库、日志和知识库维护脚本
+infra/compose/            PostgreSQL 与 Redis
+tests/
+  backend/                后端测试
+  e2e/                    前端与语音链路测试
+  load/                   并发压测
+```
+> 详细项目结构见 STRUCTURE.md
 
-主要目录：
+## 2、环境配置
 
-- `apps/web-h5`：患者端问答与历史会话。
-- `apps/admin-web`：顶部导航管理端，包含知识、评测、提示词和模型运维。
-- `backend`：FastAPI 模块化单体、模型适配器、迁移与测试。
-- `prompts`：版本化回答、安全、查询改写和医生风格提示词。
-- `evals`：脱敏评测集、规则、基线和报告。
-- `infra`：容器、网关、可观测性与部署配置。
-- `docs`：架构、数据治理、安全、测试、运维和版本记录。
+### 1、基础软件安装
+`winget install -e --id Git.Git`、`winget install -e --id Astral-sh.uv`、`winget install -e --id CoreyButler.NVMforWindows`、`winget install -e --id Docker.DockerDesktop`，安装完后重新打开终端，docker desktop首次启动时启用`WSL 2`，然后验证基础命令 `git --version`、`uv --version`、`nvm version`、`docker version`、`docker compose version`
 
-完整职责说明见 [STRUCTURE.md](STRUCTURE.md)。
 
-## 环境要求
-
-- Python `3.12`
-- [uv](https://docs.astral.sh/uv/)
-- Node.js `20`
-- pnpm `11.25.0`
-
-## 本地启动
-
-### 1. 启动后端
-
+### 2、安装 node.js 22 和 pnpm
 ```powershell
-cd F:\medical_agent\backend
-if (!(Test-Path .env)) { Copy-Item ..\.env.example .env }
-uv sync --extra dev
-uv run uvicorn medical_agent.main:app --reload --host 127.0.0.1 --port 8000
+nvm install 22
+nvm use 22
+node --version
+npm --version
+
+corepack enable
+corepack prepare pnpm@11.25.0 --activate
+pnpm --version
+
+# 如果当前 Node 安装不包含 Corepack，可使用：
+npm install -g pnpm@11.25.0
 ```
 
-默认是 `demo` 模式。健康检查地址：`http://127.0.0.1:8000/api/v1/health/live`。
-
-经理演示前请按 [Demo 演示检查清单](docs/operations/demo-checklist.md) 完成数据库迁移、模型探活、知识版本确认、隐私检查和关键流程冒烟测试。
-
-### 2. 启动患者端 H5
-
-另开一个终端：
-
+### 3、使用uv安装python3.12
 ```powershell
-cd F:\medical_agent
-pnpm install --frozen-lockfile
-pnpm dev:h5 -- --host 0.0.0.0
+uv python install 3.12
+uv python list
+uv --version
 ```
-
-本机访问终端显示的 Local 地址。同一局域网设备使用终端显示的 Network 地址。`0.0.0.0` 是监听地址，不是浏览器访问地址；配置开发证书后地址协议为 HTTPS。
-
-手机语音输入必须通过 HTTPS。运行 `pnpm setup:https -- -InstallWindowsCA` 生成局域网开发证书，并按 [运行与部署说明](docs/operations/deployment.md) 在测试手机上信任开发 CA；普通 HTTP 即使已配置跨域，也不能调用手机麦克风。
-
-Vite 开发服务器只用于开发和演示，不应直接用于医院生产环境。公网部署要求见 [运行与部署说明](docs/operations/deployment.md)。
-
-临时供外网测试时，可在前后端已启动的情况下使用 ngrok：
-
+### 4、拉取项目
 ```powershell
-& "F:\ragagent-main\ngrok\ngrok.exe" http https://127.0.0.1:5173 --host-header=rewrite
+git clone xxxx medical_agent
+cd medical_agent
 ```
 
-将 ngrok 输出的公网 HTTPS 地址发给测试人员即可。该方式只用于临时功能验证，不用于患者正式访问。
+### 5、安装项目依赖
 
-## 接入正式模型
+前端依赖：`cd medical_agent`、`pnpm install --frozen-lockfile`
 
-语音低延迟本地调试、CPU 模型安装和真实浏览器复测见 [流式语音说明](docs/operations/streaming-tts.md)。
+后端依赖：`cd medical_agent\backend`、`uv sync --extra dev --frozen`
 
-编辑 `backend/.env`：
+验证环境：`uv run python --version`、` uv run python -c "import fastapi; print(fastapi.__version__)" `
 
+### 6、创建环境配置
+复制根目录下的 `.\.env.example` 到对应backend下作为 `.env` 并依照里边内容添加对应的apikey、baseurl、model等等
+
+### 7、选择数据库
+
+（1）最小开发用本地sqlite，不用动，保持：
 ```dotenv
-LLM_PROVIDER=openai-compatible
-LLM_BASE_URL=https://your-provider.example/v1
-LLM_API_KEY=replace-me
-LLM_MODEL=replace-me
-LLM_RETRY_COUNT=1
-FALLBACK_LLM_BASE_URL=https://your-fallback-provider.example/v1
-FALLBACK_LLM_API_KEY=replace-me
-FALLBACK_LLM_MODEL=replace-with-a-fallback-model
-
-VISION_BASE_URL=https://your-provider.example/v1
-VISION_API_KEY=replace-me
-VISION_MODEL=replace-with-a-vision-model
-
-ASR_PROVIDER=openai-compatible
-ASR_BASE_URL=https://your-provider.example/v1
-ASR_API_KEY=replace-me
-ASR_MODEL=replace-with-an-asr-model
-ASR_LANGUAGE=
-
-TTS_PROTOCOL=azure-speech
-TTS_BASE_URL=https://your-region.tts.speech.microsoft.com
-TTS_API_KEY=replace-me
-TTS_MODEL=
-TTS_VOICE=zh-CN-XiaoxiaoNeural
-TTS_STREAMING_ENABLED=true
-TTS_STREAM_SAMPLE_RATE=24000
-TTS_STREAM_CHANNELS=1
+DATABASE_URL=sqlite+aiosqlite:///./medical_agent.db
+REDIS_ENABLED=false
 ```
 
-文本与视觉模型服务需兼容 OpenAI Chat Completions 流式接口，ASR 服务需兼容 `POST /audio/transcriptions`。TTS 支持 `openai-compatible`、`azure-speech`、`elevenlabs` 和可配置字段的 `custom` 协议；开启流式前必须确认服务返回原始 PCM s16le 字节流，患者端会边接收边播放，失败时自动降级为 MP3 短句和设备语音。图片请求只会发送到独立配置的视觉模型；未配置 `VISION_*` 时图片仍会进入历史，但不会误发给纯文本模型。`VISION_ENABLE_THINKING` 只应为明确支持该参数的视觉模型配置。密钥可保存在 `backend/.env`，也可由管理端写入服务器数据库的运行时配置；接口和页面不会返回明文。生产环境必须限制数据库及备份访问，禁止将密钥提交到 Git。
 
-## 导入医院 FAQ 并启用 RAG
-
-先在 `backend/.env` 中启用 RAG。Embedding 为可选配置；留空时使用本地关键词检索，配置后使用关键词与向量混合检索：
-
+（2）PostgreSQL + Redis，先确认 Docker Desktop 已启动，然后执行：
+```powershell
+cd D:\medical_agent
+docker compose -f infra/compose/compose.database.yaml up -d
+docker compose -f infra/compose/compose.database.yaml ps
+```
+将 `backend/.env` 改为：
 ```dotenv
-RAG_ENABLED=true
-RAG_TOP_K=4
-RAG_MIN_SCORE=0.16
-RAG_RELATIVE_SCORE=0.62
-RAG_REQUIRE_MATCH=true
-
-RERANKER_ENABLED=false
-RERANKER_BASE_URL=https://your-reranker.example/v1
-RERANKER_API_KEY=replace-me
-RERANKER_MODEL=replace-with-a-rerank-model
-RERANKER_CANDIDATE_K=12
-
-EMBEDDING_BASE_URL=https://your-provider.example/v1
-EMBEDDING_API_KEY=replace-me
-EMBEDDING_MODEL=replace-with-an-embedding-model
+DATABASE_URL=postgresql+asyncpg://medical_agent:medical_agent_local@127.0.0.1:55432/medical_agent
+REDIS_ENABLED=true
+REDIS_URL=redis://127.0.0.1:56379/0
+REDIS_KEY_PREFIX=medical-agent
 ```
 
-导入前先检查 FAQ，不会修改原 XLSX：
+查看容器状态或停止环境：
 
 ```powershell
-cd F:\medical_agent\backend
-uv run python scripts/profile_faq_xlsx.py "C:\path\to\hospital-faq.xlsx"
-uv run python scripts/import_faq_rag.py "C:\path\to\hospital-faq.xlsx" --name "医院 FAQ 2026-10-22" --publish
+docker compose -f infra/compose/compose.database.yaml ps
+docker compose -f infra/compose/compose.database.yaml logs --tail 100 postgres redis
+docker compose -f infra/compose/compose.database.yaml down
 ```
 
-如果 FAQ 已在配置 Embedding 前导入，可安全补全当前发布版本缺失的向量；命令可重复执行，已存在的向量不会重复计算：
+### 8、初始化数据库
+首次启动前 / 迁移数据库 都需要执行：`cd D:\medical_agent\backend`、`uv run python scripts/upgrade_database.py`
 
-```powershell
-uv run python scripts/rebuild_faq_embeddings.py
-uv run python scripts/search_rag.py "第一次就诊需要准备什么？"
-```
+### 9、启动三个服务(根目录)
+启动后端前先运行docker dasktop
+启动后端：`uv run uvicorn medical_agent.main:app --reload --host 127.0.0.1 --port 8000`
+启动患者端：`pnpm dev:h5 -- --host 0.0.0.0`
+启动管理端：`pnpm dev:admin -- --host 127.0.0.1`
 
-只有更换 Embedding 模型时才使用 `--rebuild-all`。该参数会覆盖当前版本的全部已有向量：
+默认访问地址：
 
-```powershell
-uv run python scripts/rebuild_faq_embeddings.py --rebuild-all
-```
+- 后端健康检查：`http://127.0.0.1:8000/api/v1/health/live`
+- 患者端：`http://127.0.0.1:5173`
+- 管理端：`http://127.0.0.1:5174` (用 `.env`的 `ADMIN_API_TOKEN` 登录)
 
-如果存在同一问题对应不同答案，默认拒绝发布。完成医学审核后，可以修订原文件再导入；也可显式使用 `--exclude-conflicts` 排除冲突行并发布其余内容。医院 XLSX、数据库及检索索引不得提交到 Git。
 
-以后切换到自有微调模型时，只需让服务兼容 OpenAI Chat Completions，并替换 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_MODEL`。主接口在首个输出片段前失败时默认重试一次，随后才使用 `FALLBACK_LLM_*`；已经产生输出后不会切换，避免重复回答。Rerank 接口兼容常见的 `POST /rerank` 请求与 `results[index, relevance_score]` 响应。知识导入、检索及安全模块无需重写。
-
-## 知识库管理端
-
-先在 `backend/.env` 设置独立管理员令牌并重启后端：
-
-```dotenv
-ADMIN_API_TOKEN=replace-with-a-long-random-token
-```
-
-再启动管理端：
-
-```powershell
-cd F:\medical_agent
-pnpm dev:admin -- --host 127.0.0.1
-```
-
-访问 `http://127.0.0.1:5174`，输入管理员令牌。顶部统一导航提供运行总览、知识版本、chunk 内容管理、检索评测、提示词管理和任务记录；音色、自动播报、语速及试听统一放在运行总览 → 语音合成 → 配置 → 音色与播报。运行总览集中展示聊天、视觉、ASR、Embedding、TTS，可单独编辑模型名、服务地址、超时等参数并手动探活；API Key 只写不读，单项“恢复默认”会回到 `backend/.env`。知识建议流程：复制草稿 → 导入/编辑 → 补全向量 → 评测 → 发布。检索与评测页提供真实患者链路的临时多轮测试，验证 RAG、提示词、上下文和滚动摘要，测试结束自动清理且不计入患者交互次数；各类详细结果从右侧抽屉查看。系统提示词和业务提示词一同版本化，草稿保存不生效，发布后新问答立即采用；独立医疗风险规则仍由安全模块执行。配置修改均校验现有 `ADMIN_API_TOKEN` 并写入系统操作审计。探活和多轮测试可能产生模型调用费用。全量向量重建只允许草稿；管理员令牌保存在当前标签页的 `sessionStorage`。
-
-已有数据库升级到本版时，在 `backend` 目录执行 `uv run python scripts/upgrade_database.py`，然后重新启动后端。SQLite 会先生成一致性备份；迁移兼容开发环境已创建声音设置表或上次迁移部分完成的状态，保留原提示词与已有设置。
-
-详细说明见 [知识管理手册](docs/operations/knowledge-admin.md) 与 [Docker PostgreSQL 迁移](docs/operations/postgres-migration.md)。当前任务执行器使用单 API worker，任务与评测结果持久化到数据库。
-
-## 媒体与日志
-
-- 图片保存在 `MEDIA_STORAGE_PATH` 指定的私有目录，通过授权接口读取，不作为静态文件公开。
-- 图片类型根据文件内容校验，不只信任扩展名；默认最多 4 张、单张 5 MB、总计 16 MB。
-- 多轮记忆仅限当前会话：最近 20 条消息保留原文，更早内容每累计 8 条滚动压缩为会话摘要；未达到批次或摘要失败时旧消息仍按原文带入，不会产生记忆空档。历史图片从整个当前会话独立选择最近 4 张，不受文字窗口限制，也不会跨会话复用。
-- 企业微信智能机器人 API 模式支持文字、语音转写、图片/图文混排输入和流式回复，无需公网回调地址；配置与单 worker 部署方法见 [企业微信机器人接入](docs/operations/wecom-bot.md)。
-- 微信客服作为独立回调渠道支持客户文字、图片和 AMR 语音输入，复用现有 RAG、安全、多轮上下文、图片上下文、历史记录与问答日志；需要公网 HTTPS 回调、持久化游标和数据库迁移，详见 [微信客服接入](docs/operations/wechat-kf.md)。
-- 企业微信内嵌患者 H5 可通过 JS-SDK 原生选择相册并一次选择多张图片；使用独立自建应用凭据和受限域名签名，详见 [企业微信 H5 图片多选接入](docs/operations/wecom-h5.md)。
-- 浏览器只负责临时录音，后端调用 `ASR_*` 配置的模型完成转写；原始麦克风音频默认不落盘，只保存转写后发送的文字。
-- 回答播报支持浏览器设备 TTS 或兼容接口的云端 TTS，不保存音频文件。新回答随模型流式输出按自然短句尽早播报，云端音频按序预取；顶部声音键记住静音偏好，历史消息不自动朗读。后台支持音色与播报参数、试听；云端通过 `TTS_*` 配置，支持填写供应商已创建的自定义/克隆音色 ID。创建或训练音色仍在供应商侧完成。部分手机浏览器需用户手势或音频权限才能播放。
-- 应用日志写入 `LOG_FILE_PATH`，默认单文件 10 MB、保留 10 个轮转文件，不记录问题正文、转写文字或图片内容。
-- 问答追踪日志写入 `INTERACTION_LOG_FILE_PATH`，默认是 `backend/logs/interactions.jsonl`；每行是一条完整 JSON 记录，可通过 `interaction_id`、`conversation_id` 和消息 ID 定位一次问答，并包含实际使用的提示词版本 ID 与校验值。
-- 如在 `backend/.env` 启用 `INTERACTION_LOG_INCLUDE_CONTENT=true`，问答追踪日志会保存用户文字和模型完整回答；图片只记录媒体 ID、类型和数量，不保存二进制内容，原始录音仍不落盘。模板默认关闭正文记录。
-- 生产环境应限制日志目录访问权限，并按医院要求设置 `INTERACTION_LOG_INCLUDE_CONTENT`、文件大小、轮转数量和销毁周期。关闭正文后仍保留长度、SHA-256、状态、耗时和错误信息。
-
-查看最近的问答追踪记录：
-
-```powershell
-cd F:\medical_agent\backend
-Get-Content .\logs\interactions.jsonl -Tail 20
-```
-
-## 质量检查
-
-```powershell
-cd F:\medical_agent\backend
-uv run pytest
-uv run ruff check .
-uv run pyright
-
-cd F:\medical_agent
-pnpm lint
-pnpm typecheck
-pnpm build
-```
-
-前后端服务运行后，可执行端到端检查：
-
-```powershell
-pnpm test:e2e:stream
-pnpm test:e2e:visual
-pnpm test:e2e:markdown
-pnpm test:e2e:voice
-```
-
-## 版本管理
-
-- `main` 仅保存最终验收后的稳定版本，不直接开发。
-- 阶段分支格式为 `medical_agent_26_MM_DD`。
-- 当前 Demo 测试版为 `0.4.0`，阶段分支为 `medical_agent_26_10_26`，建议标签为 `v26.10.26-demo`。
-- 第三版 RAG 基线仍保留在 `medical_agent_26_10_22`，标签为 `v26.10.22`；第二版稳定分支仍为 `medical_agent_26_10_18`。
-- 功能开发可使用 `feature/<name>`，完成后合并回对应阶段分支。
-
-详细规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-## 数据与安全
-
-医院源文件、患者数据、凭据、日志、数据库、模型权重和生成媒体不得进入 Git。提交前请阅读 [SECURITY.md](SECURITY.md) 与 [数据处理规范](docs/security/data-handling.md)。
-
-## 许可证
-
-本仓库当前未设置开源许可证。除非项目权利方另行书面授权，仓库内容不代表授予复制、分发或商用许可。

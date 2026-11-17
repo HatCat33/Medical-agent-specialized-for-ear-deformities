@@ -55,6 +55,6 @@ jobs:
           enable-cache: true
           cache-dependency-glob: backend/uv.lock
       - run: uv sync --extra dev --frozen
-      - run: uv run ruff check .
+      - run: uv run ruff check src ../tests/backend ../tests/load
       - run: uv run pyright
       - run: uv run pytest

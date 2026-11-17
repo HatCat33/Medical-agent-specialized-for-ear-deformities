@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from medical_agent.api.dependencies import require_admin_token
 from medical_agent.core.config import get_settings
 from medical_agent.core.database import get_db
+from medical_agent.core.redis import CapacitySnapshot, capacity_snapshot
 from medical_agent.modules.speech.synthesis import (
     effective_model,
     effective_voice,
@@ -29,6 +30,7 @@ from medical_agent.modules.system.schemas import (
     ModelConfigurationUpdate,
     PromptCreate,
     PromptUpdate,
+    RetrievalConfigurationUpdate,
     SpeechPreviewRequest,
     SpeechSettings,
 )
@@ -97,6 +99,11 @@ async def models(db: Db) -> dict[str, Any]:
     return await model_service.model_inventory(db, get_settings())
 
 
+@router.get("/capacity")
+async def capacity() -> CapacitySnapshot:
+    return capacity_snapshot(get_settings())
+
+
 @router.get("/models/configuration")
 async def model_configuration(db: Db) -> dict[str, Any]:
     return await model_config_service.list_configuration(db)
@@ -118,6 +125,25 @@ async def reset_model_configuration(kind: str, db: Db) -> dict[str, Any]:
     return await model_config_service.reset_configuration(db, kind=kind)
 
 
+@router.get("/retrieval/configuration")
+async def retrieval_configuration(db: Db) -> dict[str, int | float]:
+    return await model_config_service.retrieval_configuration(db)
+
+
+@router.put("/retrieval/configuration")
+async def update_retrieval_configuration(
+    payload: RetrievalConfigurationUpdate, db: Db
+) -> dict[str, int | float]:
+    return await model_config_service.save_retrieval_configuration(
+        db, **payload.model_dump()
+    )
+
+
+@router.delete("/retrieval/configuration")
+async def reset_retrieval_configuration(db: Db) -> dict[str, int | float]:
+    return await model_config_service.reset_retrieval_configuration(db)
+
+
 @router.get("/speech", response_model=SpeechSettings)
 async def speech_settings(db: Db) -> SpeechSettings:
     return await speech_service.read_settings(db)
@@ -133,7 +159,7 @@ async def speech_provider() -> dict[str, Any]:
         "default_voice": effective_voice(SpeechSettings(), settings),
         "effective_default_voice": effective_voice(SpeechSettings(), settings),
         "voice_options": voice_options(settings),
-        "endpoint_host": "本机 CPU" if settings.tts_protocol == "local-sherpa" else model_service.safe_host(settings.tts_base_url),
+        "endpoint_host": model_service.safe_host(settings.tts_base_url),
     }
 
 
@@ -152,8 +178,7 @@ async def speech_preview(payload: SpeechPreviewRequest, db: Db) -> Response:
         )
         await db.commit()
         raise HTTPException(502, {"code": "tts_preview_failed", **diagnostics}) from exc
-    media_type = "audio/wav" if settings.tts_protocol == "local-sherpa" else "audio/mpeg"
-    return Response(content=audio, media_type=media_type, headers={"Cache-Control": "no-store"})
+    return Response(content=audio, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
 
 
 @router.post("/speech/probe")

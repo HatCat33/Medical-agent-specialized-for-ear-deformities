@@ -3,13 +3,26 @@
 import hashlib
 import io
 import json
+import re
 import uuid
+from datetime import date, datetime
 from typing import Annotated, Any, Literal
+from urllib.parse import quote
 from xml.etree.ElementTree import ParseError
 from zipfile import BadZipFile, ZipFile
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
-from sqlalchemy import func, or_, select
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+)
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -17,10 +30,15 @@ from starlette.concurrency import run_in_threadpool
 from medical_agent.api.dependencies import require_admin_token
 from medical_agent.core.config import get_settings
 from medical_agent.core.database import get_db, session_factory
-from medical_agent.modules.conversation.models import Message
+from medical_agent.core.redis import store
 from medical_agent.modules.ingestion.faq_xlsx import parse_faq_xlsx
 from medical_agent.modules.knowledge import admin_service as service
-from medical_agent.modules.knowledge import conversation_test_service
+from medical_agent.modules.knowledge import (
+    conversation_test_service,
+    interaction_analytics,
+    interaction_export,
+    retriever,
+)
 from medical_agent.modules.knowledge.admin_schemas import (
     ConversationTestRequest,
     DraftRequest,
@@ -35,6 +53,8 @@ from medical_agent.modules.knowledge.models import (
     KnowledgeRelease,
 )
 from medical_agent.modules.knowledge.schemas import EmbeddingRebuildRequest
+from medical_agent.modules.knowledge.service import question_key
+from medical_agent.modules.system import counter_service
 
 router = APIRouter(
     prefix="/admin/knowledge", tags=["admin-knowledge"], dependencies=[Depends(require_admin_token)]
@@ -48,6 +68,15 @@ async def overview(db: Db) -> dict[str, Any]:
     return {
         "rag_enabled": settings.rag_enabled,
         "database": db.bind.dialect.name if db.bind else "unknown",
+        "redis_enabled": settings.redis_enabled,
+        "redis_connected": store.available,
+        "embedding_cache_enabled": (
+            settings.redis_enabled and settings.embedding_cache_ttl_seconds > 0
+        ),
+        "retrieval_cache_enabled": (
+            settings.redis_enabled and settings.retrieval_cache_ttl_seconds > 0
+        ),
+        "tts_cache_enabled": settings.redis_enabled and settings.tts_cache_ttl_seconds > 0,
         "embedding_configured": bool(
             settings.embedding_model and settings.embedding_base_url and settings.embedding_api_key
         ),
@@ -71,11 +100,9 @@ async def overview(db: Db) -> dict[str, Any]:
         or 0,
         "chunk_strategy": "一条 FAQ（问题 + 其他问法 + 答案）为一个 chunk",
         "vector_storage": "数据库 JSON 向量，应用层混合检索",
-        # One accepted user message is one interaction; the assistant reply is not counted again.
-        "interaction_count": await db.scalar(
-            select(func.count()).select_from(Message).where(Message.role == "user")
-        )
-        or 0,
+        "interaction_count": await counter_service.value(
+            db, counter_service.PATIENT_INTERACTIONS
+        ),
         "active_jobs": await db.scalar(
             select(func.count())
             .select_from(KnowledgeOperation)
@@ -83,6 +110,59 @@ async def overview(db: Db) -> dict[str, Any]:
         )
         or 0,
     }
+
+
+@router.get("/interaction-analytics")
+async def interaction_analytics_view(
+    db: Db,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    user_id: str = Query(default="", max_length=40),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    return await interaction_analytics.analytics(
+        db,
+        start_date=start_date,
+        end_date=end_date,
+        user_id=user_id,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/interaction-analytics/export")
+async def export_interaction_records(
+    db: Db,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    user_id: str = Query(default="", max_length=40),
+) -> Response:
+    items = await interaction_analytics.export_items(
+        db,
+        start_date=start_date,
+        end_date=end_date,
+        user_id=user_id,
+    )
+    if not items:
+        raise HTTPException(404, "interaction_export_empty")
+    generated_at = datetime.now(interaction_analytics.DISPLAY_TIMEZONE)
+    filename = f"用户交互记录-{generated_at:%Y%m%d-%H%M%S}.xlsx"
+    content = interaction_export.build_interaction_workbook(
+        items,
+        sheet_name=generated_at.strftime("%Y.%m"),
+    )
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=interaction-records-{generated_at:%Y%m%d-%H%M%S}.xlsx; "
+                f"filename*=UTF-8''{quote(filename)}"
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.get("/releases")
@@ -128,37 +208,97 @@ async def entries(
     release_id: str,
     db: Db,
     q: str = Query(default="", max_length=200),
+    category: str = Query(default="", max_length=120),
+    search_mode: Literal["text", "semantic"] = "text",
     vector: Literal["all", "pending", "ready"] = "all",
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:
     await service.require_release(db, release_id)
     conditions = [KnowledgeEntry.release_id == release_id]
-    if q.strip():
-        conditions.append(
-            or_(
-                KnowledgeEntry.question.contains(q.strip(), autoescape=True),
-                KnowledgeEntry.answer.contains(q.strip(), autoescape=True),
-                KnowledgeEntry.category.contains(q.strip(), autoescape=True),
-            )
+    query = q.strip()
+    semantic_order: dict[str, int] = {}
+    if query and search_mode == "semantic":
+        settings = get_settings().model_copy(
+            update={
+                "rag_top_k": 100,
+                "rag_min_score": 0.05,
+                "rag_relative_score": 0.2,
+                "reranker_enabled": False,
+            }
         )
+        result = await retriever.retrieve_detailed(
+            db, query=query, settings=settings, release_id=release_id
+        )
+        semantic_order = {hit.entry_id: index for index, hit in enumerate(result.hits)}
+        if not semantic_order:
+            return {
+                "items": [], "total": 0, "page": page, "page_size": page_size,
+                "categories": list(
+                    await db.scalars(
+                        select(KnowledgeEntry.category)
+                        .where(KnowledgeEntry.release_id == release_id)
+                        .distinct()
+                        .order_by(KnowledgeEntry.category)
+                    )
+                ),
+            }
+        conditions.append(KnowledgeEntry.id.in_(semantic_order))
+    tokens = [item for item in re.split(r"[\s,，。；;、]+", query) if item]
+    searchable = (
+        KnowledgeEntry.question,
+        KnowledgeEntry.aliases,
+        KnowledgeEntry.answer,
+        KnowledgeEntry.category,
+    )
+    for token in tokens if search_mode == "text" else []:
+        conditions.append(
+            or_(*(column.contains(token, autoescape=True) for column in searchable))
+        )
+    if category.strip():
+        conditions.append(KnowledgeEntry.category == category.strip())
     if vector == "pending":
         conditions.append(KnowledgeEntry.embedding_json.is_(None))
     elif vector == "ready":
         conditions.append(KnowledgeEntry.embedding_json.is_not(None))
     total = await db.scalar(select(func.count()).select_from(KnowledgeEntry).where(*conditions))
+    relevance = (
+        case((KnowledgeEntry.question == query, 0), else_=1),
+        case((KnowledgeEntry.question.contains(query, autoescape=True), 0), else_=1),
+        case((KnowledgeEntry.aliases.contains(query, autoescape=True), 0), else_=1),
+        case((KnowledgeEntry.category.contains(query, autoescape=True), 0), else_=1),
+        case((KnowledgeEntry.answer.contains(query, autoescape=True), 0), else_=1),
+    ) if query and search_mode == "text" else ()
+    semantic_relevance = (
+        case(semantic_order, value=KnowledgeEntry.id, else_=len(semantic_order)),
+    ) if semantic_order else ()
     rows = await db.scalars(
         select(KnowledgeEntry)
         .where(*conditions)
-        .order_by(KnowledgeEntry.source_sheet, KnowledgeEntry.source_row, KnowledgeEntry.id)
+        .order_by(
+            *relevance,
+            *semantic_relevance,
+            KnowledgeEntry.source_sheet,
+            KnowledgeEntry.source_row,
+            KnowledgeEntry.id,
+        )
         .offset((page - 1) * page_size)
         .limit(page_size)
+    )
+    categories = list(
+        await db.scalars(
+            select(KnowledgeEntry.category)
+            .where(KnowledgeEntry.release_id == release_id)
+            .distinct()
+            .order_by(KnowledgeEntry.category)
+        )
     )
     return {
         "items": [service.entry_view(row) for row in rows],
         "total": total,
         "page": page,
         "page_size": page_size,
+        "categories": categories,
     }
 
 
@@ -195,12 +335,8 @@ async def delete_entry(release_id: str, entry_id: str, db: Db) -> dict[str, bool
     return {"ok": True}
 
 
-@router.post("/releases/{release_id}/import")
-async def import_xlsx(
-    release_id: str, db: Db, file: Annotated[UploadFile, File()]
-) -> dict[str, Any]:
-    await service.require_release(db, release_id, draft=True, idle=True)
-    source_name = (file.filename or "FAQ.xlsx").replace("\\", "/").split("/")[-1]
+async def _read_xlsx(file: UploadFile) -> tuple[str, bytes, list[Any], Any]:
+    source_name = (file.filename or "knowledge.xlsx").replace("\\", "/").split("/")[-1]
     if not source_name.lower().endswith(".xlsx"):
         raise HTTPException(422, "xlsx_required")
     data = await file.read(10 * 1024 * 1024 + 1)
@@ -216,8 +352,51 @@ async def import_xlsx(
         raise HTTPException(422, "invalid_faq_xlsx") from exc
     if not parsed or profile.valid_rows != profile.source_rows:
         raise HTTPException(422, "faq_has_invalid_rows")
+    return source_name, data, parsed, profile
+
+
+@router.post("/releases/{release_id}/import-preview")
+async def preview_xlsx(
+    release_id: str, db: Db, file: Annotated[UploadFile, File()]
+) -> dict[str, Any]:
+    source_name, data, parsed, profile = await _read_xlsx(file)
+    result = await service.preview_entries(db, release_id, parsed)
+    return {
+        **result,
+        "source_name": source_name,
+        "checksum": hashlib.sha256(data).hexdigest(),
+        "warnings": profile.warnings,
+    }
+
+
+@router.post("/releases/{release_id}/import-apply")
+async def apply_xlsx(
+    release_id: str,
+    db: Db,
+    file: Annotated[UploadFile, File()],
+    selected_rows: Annotated[str, Form()],
+    checksum: Annotated[str, Form(min_length=64, max_length=64)],
+    draft_checksum: Annotated[str, Form(min_length=64, max_length=64)],
+) -> dict[str, Any]:
+    source_name, data, parsed, profile = await _read_xlsx(file)
+    actual_checksum = hashlib.sha256(data).hexdigest()
+    if actual_checksum != checksum:
+        raise HTTPException(409, "xlsx_changed_after_preview")
+    try:
+        requested = {int(row) for row in json.loads(selected_rows)}
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, "invalid_import_selection") from exc
+    selected = [item for item in parsed if item.source_row in requested]
+    if not selected or len(selected) != len(requested):
+        raise HTTPException(422, "invalid_import_selection")
+    selected_question_keys = [question_key(item.question) for item in selected]
+    if len(selected_question_keys) != len(set(selected_question_keys)):
+        raise HTTPException(422, "invalid_import_selection")
+    current = await service.preview_entries(db, release_id, parsed)
+    if current["draft_checksum"] != draft_checksum:
+        raise HTTPException(409, "knowledge_draft_changed_after_preview")
     counts = await service.merge_entries(
-        db, release_id, parsed, source_name, hashlib.sha256(data).hexdigest()
+        db, release_id, selected, source_name, actual_checksum
     )
     return {**counts, "warnings": profile.warnings}
 

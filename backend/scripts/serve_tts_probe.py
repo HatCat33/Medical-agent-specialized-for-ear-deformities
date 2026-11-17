@@ -26,10 +26,6 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     async with session_factory() as db:
         await load_runtime_model_configuration(db)
         preferences = await read_settings(db)
-    if get_settings().tts_protocol == "local-sherpa":
-        from medical_agent.modules.speech.local_tts import warm_local_tts
-
-        await warm_local_tts(get_settings())
     yield
     await close_synthesis_clients()
     await close_db()

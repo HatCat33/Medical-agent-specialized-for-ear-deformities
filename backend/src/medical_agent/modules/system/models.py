@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, Float, String, Text
+from sqlalchemy import BigInteger, DateTime, Float, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from medical_agent.core.database import Base
@@ -46,3 +46,15 @@ class RuntimeSetting(Base):
 
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value_json: Mapped[str] = mapped_column(Text)
+
+
+class SystemCounter(Base):
+    """Monotonic business counters that must survive content deletion."""
+
+    __tablename__ = "system_counters"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    value: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )

@@ -33,6 +33,7 @@ blob-report/
 *-debug.log*
 
 # Runtime data (never commit patient or hospital data)
+/runtime/
 data/
 uploads/
 models/
@@ -51,9 +52,7 @@ backups/
 # Generated artifacts
 .artifacts/
 /admin-web-dist.tar.gz
-evals/reports/*
-!evals/reports/.gitkeep
-packages/api-client/src/generated/
+/medical-agent-backend.tar.gz
 
 # Editors and OS
 .idea/
